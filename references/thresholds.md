@@ -1,171 +1,170 @@
 # Rightsizing decision rules
 
-These are defaults tuned for "don't cry wolf, but don't miss a real problem." Adjust per user
-risk tolerance — a user optimizing hard for cost will want lower scale-down bars; a user who
-says latency/incidents matter most wants lower scale-up bars and should probably keep more
-headroom than these defaults leave.
+These are defaults tuned for "don't cry wolf, but don't miss a real problem." Adjust per user risk
+tolerance: a user optimizing hard for cost will want lower scale-down bars; a user who says latency
+or incidents matter most wants lower scale-up bars and more headroom than these defaults leave.
 
-## Scale UP triggers (any one is sufficient to recommend, list all that fired)
+The constants live at the top of `scripts/rightsizing.py`; keep them and this page in sync.
 
-| Signal | Threshold | Window |
+## How a cluster is evaluated
+
+- **Every node is evaluated on its own**, then the replica set (or shard) is judged by its worst
+  node. Pooling primary and secondary samples would let two idle secondaries hide a primary pinned
+  at 90% CPU.
+- Each disk partition is evaluated on its own too.
+- Percentiles are taken over the node's own samples for the whole window.
+
+## Scale UP triggers (any one is enough; every one that fired is listed)
+
+| Signal | Threshold | Sustained? |
 |---|---|---|
-| Normalized CPU (user+kernel) | p95 > 80% | sustained across ≥ 3 of the last 7 days |
-| Memory | free memory p95 < 10% of total, or rising eviction/cache-churn trend | last 7 days |
-| Disk IOPS | p95 > 90% of provisioned IOPS | sustained across ≥ 3 of the last 7 days |
-| Disk space used | p95 > 90% of capacity (NOT I/O saturation — see below) | sustained across ≥ 3 of the last 7 days |
-| Disk latency | read or write p95 > 15ms (heuristic, see below) | last 7 days |
-| Connections | p95 > 80% of tier's max connections | last 7 days |
-| Concurrency queuing | read or write queue depth p95 > 0 ops (see below — NOT ticket count) | last 7 days |
-| Page faults | p95 > 1.0/sec (heuristic, see below) | last 7 days |
-| Cache fill ratio | p95 > 80% (WT `eviction_target`, see below) | last 7 days |
-| Dirty fill ratio | p95 > 5% (WT `eviction_dirty_target`, see below) | last 7 days |
+| Normalized CPU (user + kernel) | p95 > 80% | yes |
+| Free memory | p5 < 10% of (free + used), i.e. low for at least 5% of the window | no |
+| Disk IOPS (read + write) | p95 > 90% of provisioned IOPS | yes |
+| Disk space used | p95 > 90% of capacity (NOT I/O saturation) | yes |
+| Disk latency (read or write) | p95 > 15ms (heuristic) | no |
+| Connections | p95 > 80% of the tier's per-node limit | no |
+| Concurrency queuing | read or write queue depth p95 > 0 (NOT ticket count) | no |
+| Page faults | p95 > 1.0/sec (heuristic) | no |
+| Cache fill ratio | p95 > 80% (WT `eviction_target`) | no |
+| Dirty fill ratio | p95 > 5% (WT `eviction_dirty_target`) | no |
 
-If multiple signals fire together (e.g. CPU + IOPS), say so explicitly — it changes the fix
-(compute tier bump vs. IOPS bump vs. both) and a single-signal trigger deserves less confidence
-than a multi-signal one.
+**Sustained** means the threshold is also breached on at least 3 of the last 7 UTC days (a day
+counts when that day's own p95 is over the threshold). Shorter windows need proportionally fewer
+days, minimum 1. A p95 over the threshold that isn't sustained is reported as "close to a trigger",
+not as a trigger.
 
-### Disk latency / throughput / iowait (and the "disk utilization" mislabeling)
+**Disk-only verdict:** if every trigger that fired is a disk signal (IOPS, disk space, disk
+latency), the verdict is **change disk / IOPS only**: check whether more IOPS or a bigger disk
+resolves it before recommending a compute tier jump. Dedicated tiers support independently
+provisioned IOPS on most cloud providers.
 
-**Correction:** earlier versions of this script and this doc called this trigger "disk
-utilization" and treated it as an I/O-saturation signal (the classic `iostat %util` meaning —
-"what fraction of the time is the disk busy"). It isn't one. The underlying metric,
-`DISK_PARTITION_SPACE_PERCENT_USED`, was verified against `DISK_PARTITION_SPACE_USED` /
-`DISK_PARTITION_SPACE_FREE` at matching timestamps and matches `used/(used+free)*100` exactly —
-it's disk **capacity** consumed, not I/O saturation. Still a legitimate trigger (running out of
-disk space is a real problem), just correctly named "disk space used" now, both in code and here.
+If several signals fire together (e.g. CPU + IOPS), say so explicitly: it changes the fix (compute
+bump vs. IOPS bump vs. both).
 
-The script had no real I/O-saturation/throughput signal at all until this was added. The fix:
+### Memory
 
-- **`DISK_PARTITION_LATENCY_READ`/`WRITE`** (ms per operation) is the trigger. Latency is the
-  right choice over throughput because it needs no ceiling to be meaningful — rising per-op
-  latency directly means queries are getting slower, regardless of the disk's absolute capacity.
-  The `p95 > 15ms` cutoff is a heuristic, **not derived from MongoDB/Atlas documentation** (same
-  treatment as the page-fault threshold) — tune it against your own workload's baseline.
-- **`DISK_PARTITION_THROUGHPUT_READ`/`WRITE`** (bytes/sec) are pulled for context only. Unlike
-  `diskIOPS`, Atlas's cluster config doesn't expose a "provisioned throughput" ceiling to compare
-  against, so there's no principled way to turn a raw bytes/sec number into a trigger threshold
-  that means the same thing across different tiers and disk types.
-- **`SYSTEM_NORMALIZED_CPU_IOWAIT`** is pulled for context too — rising iowait alongside rising
-  latency corroborates that the CPU is actually stalling on disk I/O (a more direct
-  application-impact signal than latency alone), and is included in the trigger's reason text
-  when elevated (p95 > 5%) at the same time latency fires.
+Free memory is a low-is-bad metric, so it's judged on the **low end** of the window (p5), computed
+per sample as `free / (free + used)`. An earlier version compared the *p95* of free memory against
+10%, which only fired if memory was nearly exhausted 95% of the time. Low free memory is still a
+weak signal on its own (Linux uses spare RAM for page cache); page faults and cache fill are more
+direct.
 
-### Connections (correction: was documented but never implemented)
+### Disk space vs. disk I/O
 
-This row existed in this doc from early in the script's history, but `CONNECTIONS` was only ever
-pulled into the report table — there was no actual threshold logic behind it. Now implemented
-against `TIER_MAX_CONNECTIONS` in `rightsizing.py`. **Verification status: only the M10 value
-(1500) has been independently confirmed**, by reading `db_diagnostics.py`'s live
-`serverStatus().connections` against a real M10 cluster (`current` + `available` summed to
-exactly 1500). The other tiers are MongoDB's commonly published Atlas limits, not re-verified in
-this project — confirm against a live cluster or Atlas's own documentation before trusting them,
-the same caveat as the code comment on `TIER_MAX_CONNECTIONS`.
+`DISK_PARTITION_SPACE_PERCENT_USED` is disk **capacity** consumed (it matches
+`used / (used + free) * 100` exactly), not I/O busy time. The I/O signal is
+`DISK_PARTITION_LATENCY_READ`/`WRITE` (ms per op): it needs no ceiling to be meaningful, since
+rising per-op latency directly means queries are slower. The 15ms cutoff is a heuristic, not from
+MongoDB/Atlas documentation; tune it to your workload. Throughput (bytes/sec) and CPU iowait are
+quoted as context next to a latency trigger; Atlas exposes no provisioned-throughput ceiling to turn
+throughput into a trigger.
+
+### IOPS
+
+Provisioned IOPS is a combined budget, so read and write IOPS are summed per timestamp before
+comparing. If the cluster config doesn't report `diskIOPS`, the check is skipped and the report says
+so (never silently).
+
+### Connections
+
+Compared against `TIER_MAX_CONNECTIONS` in `rightsizing.py`, from "Connection Limits and Cluster
+Tier" at https://www.mongodb.com/docs/atlas/reference/atlas-limits/ (checked 2026-09-22). That page
+has several tables (by cloud provider / cluster class) that disagree for some tiers: M40 is 4000 or
+6000, M80 is 64000 or 96000. The check uses the lower value, so it errs toward flagging, and the
+report quotes the range. R-series (low-CPU) and `_NVME` tiers use their M-number's entry. M10's 1500
+was also confirmed on a live cluster (`serverStatus().connections`: current + available = 1500).
+Tiers not in the table skip the check with a note.
 
 ### Concurrency queuing (not WiredTiger ticket count)
 
-An earlier version of this script triggered on `TICKETS_AVAILABLE_READS`/`TICKETS_AVAILABLE_WRITE`
-being low (p50 < 5). **That trigger was removed — it produces false positives on MongoDB 7.0+.**
+The old trigger on low `TICKETS_AVAILABLE_READS`/`WRITE` was removed: since MongoDB 7.0 the ticket
+pool is resized dynamically, so a low "available" count can just mean a light workload. On this
+skill's MongoDB 8.0 test cluster, tickets available held at p50=4 all week while
+`GLOBAL_LOCK_CURRENT_QUEUE_READERS` stayed at max 0: nothing ever waited.
 
-Before 7.0, WiredTiger used a static concurrency ticket pool (128 read / 128 write by default,
-fixed unless manually configured), so a low "tickets available" reading reliably meant the pool
-was nearly exhausted. MongoDB 7.0 introduced dynamic execution control: the ticket pool is now
-resized automatically based on observed throughput. A low "available" count no longer reliably
-means exhaustion — it can just as easily mean the algorithm sized the pool small because the
-workload is genuinely light, and there is no Atlas-exposed metric for the pool's *current total*
-size to compute a real utilization ratio against.
-
-This was confirmed empirically, not just theoretically: on this skill's own MongoDB 8.0 test
-cluster, `TICKETS_AVAILABLE_READS` held at p50=4 for a full week — which the old rule flagged as
-SCALE UP every single run — while `GLOBAL_LOCK_CURRENT_QUEUE_READERS` stayed at p95=0, max=0 for
-the entire window. Nothing was ever actually waiting for a ticket.
-
-**The fix: trigger on queue depth instead.** `GLOBAL_LOCK_CURRENT_QUEUE_READERS`/`WRITERS` count
-operations actually queued waiting for a concurrency slot right now — the real symptom, not an
-internal pool-sizing artifact — and mean the same thing regardless of MongoDB version or whether
-the ticket pool is static or dynamic. The `p95 > 0` cutoff (rather than `max > 0`) is deliberate:
-a single momentary blip to 1 queued operation is normal noise, not a signal; requiring it in more
-than 5% of samples filters that out while still catching recurring contention. `OP_EXECUTION_TIME_
-READS`/`WRITES` are pulled as corroborating context (rising execution time alongside queuing
-strengthens the case that it's actually impacting the workload), and `TICKETS_AVAILABLE_READS`/
-`WRITE` are still pulled for context too — just no longer as the trigger.
+The trigger is queue depth (`GLOBAL_LOCK_CURRENT_QUEUE_READERS`/`WRITERS`): operations actually
+waiting for a slot, which means the same thing on any version. `p95 > 0` ignores a single blip but
+catches contention in more than 5% of samples. At hourly granularity each sample is an hourly
+average, so this is sensitive; confirm with `OP_EXECUTION_TIME_*` (quoted as context). Ticket counts
+are still pulled for context.
 
 ### WiredTiger cache pressure (page faults)
 
-`EXTRA_INFO_PAGE_FAULTS` (rate, per second) is a more direct signal of an undersized WT cache than
-`SYSTEM_MEMORY_FREE`: low free host memory is often just Linux using spare RAM for filesystem page
-cache and is not itself a problem, whereas a rising page-fault rate means MongoDB is actually going
-to disk for pages that should be in the WT cache. The `p95 > 1.0/sec` cutoff is **not derived from
-MongoDB/Atlas documentation** — it's a conservative, sensitive-by-design heuristic (Atlas storage is
-SSD-backed, so faulting is cheap per-occurrence, but a sustained rate above roughly-zero is still
-worth surfacing). Treat a lone page-fault trigger as weaker evidence than CPU/IOPS/disk-utilization
-triggers, and check whether `CACHE_BYTES_READ_INTO` is also elevated (pulled for context, not itself
-a trigger) before recommending a RAM-focused tier bump. Tune this threshold against your own
-workload's baseline once you have a few reports to compare.
+`EXTRA_INFO_PAGE_FAULTS` (per second) is a more direct sign of an undersized cache than free memory:
+it means MongoDB is going to disk for pages that should be cached. The `p95 > 1.0/sec` cutoff is a
+deliberately sensitive heuristic, not from documentation (Atlas storage is SSD-backed, so each
+fault is cheap). Treat a lone page-fault trigger as weaker evidence than CPU/IOPS triggers, and look
+at `CACHE_BYTES_READ_INTO` (quoted as context) before recommending a RAM-focused bump.
 
 ### WiredTiger eviction thresholds (cache fill / dirty fill ratio)
 
-WiredTiger has four built-in eviction thresholds, as percentages of the *configured* cache size
-(not host RAM):
+WiredTiger's eviction thresholds, as percentages of the *configured* cache (not host RAM):
 
 | Parameter | Default | Behavior |
 |---|---|---|
-| `eviction_target` | 80% | Background eviction threads start working to bring overall cache usage back down |
-| `eviction_trigger` | 95% | **Pressured state**: application threads are recruited to evict pages themselves, stalling reads/writes |
-| `eviction_dirty_target` | 5% | Background eviction starts working on dirty (not-yet-checkpointed) pages |
-| `eviction_dirty_trigger` | 20% | **Pressured state**: application threads are recruited to evict dirty pages specifically — more expensive than clean-page eviction since it requires a disk write |
+| `eviction_target` | 80% | Background eviction threads start bringing usage down |
+| `eviction_trigger` | 95% | **Pressured**: application threads are recruited to evict, stalling reads/writes |
+| `eviction_dirty_target` | 5% | Background eviction starts on dirty (not yet checkpointed) pages |
+| `eviction_dirty_trigger` | 20% | **Pressured**: application threads evict dirty pages, which needs a disk write |
 
-The script triggers on the `_target` values (80% / 5%), not the harder `_trigger` values (95% /
-20%). This is a deliberate choice to flag sustained *background* eviction pressure before it
-escalates to the fully pressured, application-thread-stalling state — it will fire earlier and
-more often than a trigger-based threshold would. If false positives become a problem for a
-particular workload, consider moving these to the `_trigger` values instead (95% / 20%) for a
-more conservative (later, less sensitive) signal.
+The script triggers on the `_target` values (80% / 5%) to flag sustained background eviction
+before it becomes application-thread stalling. If that's too noisy for a workload, move to the
+`_trigger` values (95% / 20%). `CACHE_FILL_RATIO` and `DIRTY_FILL_RATIO` are already 0–100; don't
+multiply by 100.
 
-`CACHE_FILL_RATIO` and `DIRTY_FILL_RATIO` from the Atlas Admin API report `units: PERCENT` as
-already-scaled 0–100 values (e.g. a reading of `78.3` means 78.3%) — **do not** multiply by 100.
+## Scale DOWN candidate (ALL of the following, on EVERY node; deliberately conservative)
 
-## Scale DOWN candidate (requires ALL of the following — this should be a conservative call)
+- CPU (user + kernel) p95 < 20%
+- Free memory p5 > 40% (consistently, not on average)
+- On every disk partition: space used p95 < 50%, IOPS (read + write) p95 < 50% of provisioned (when
+  known), read and write latency p95 < 5ms
+- Page faults p95 < 0.5/sec, cache fill p95 < 50%, dirty fill p95 < 2%
+- No queuing at all (queue depth max = 0)
+- Connections p95 < 30% of the tier's limit
+- At least 7 days of data, ≥ 90% sample coverage (no significant gaps), and nothing close to a
+  scale-up trigger
 
-- Normalized CPU p95 < 20% for the entire window, not just average
-- Memory: free memory consistently > 40% of total
-- Disk IOPS and utilization both well under 50% of their ceilings
-- Connections well under the tier's limit
-- At least 7 full days of data (30 preferred) with no gaps, and the window should be checked
-  against the user for known low-traffic periods (don't recommend downsizing off of a holiday
-  week's data)
-
-Report scale-down candidates with an explicit confidence caveat and ask whether the lookback
-window captures peak traffic (month-end, seasonal, marketing campaigns) before treating it as
-a strong recommendation.
+Present scale-down candidates with a confidence caveat and ask whether the window captures peak
+traffic (month-end, seasonal, campaigns) before treating it as a strong recommendation. If compute
+auto-scaling with scale-down is on, Atlas should downsize by itself; the report says to lower
+`minInstanceSize` instead of changing the tier manually.
 
 ## No change
 
-None of the above triggers, OR signals are mixed/borderline (e.g. p95 CPU at 55%, comfortably
-mid-range) — say so plainly rather than forcing a recommendation. "Currently well-matched" is a
-valid and useful output.
+No trigger fired, and the scale-down bar isn't met. Say so plainly; "currently well-matched" is a
+valid result. If some metric is **close to a trigger** (p95 within 10% of it, or over it but not
+sustained), the report lists it and confidence is low.
 
-**This is different from "insufficient data."** If a cluster/shard returns zero metrics for the
-whole requested window (too new — check its creation time — paused, or unreachable), the script
-reports `insufficient_data` / confidence `low`, not `no_change` / high confidence. Confirmed as a
-real failure mode: a cluster created ~30 minutes before a 7-day audit ran against it returned a
-completely empty metric table, and without this distinction the script reported "no thresholds
-crossed, confidence: high" — indistinguishable from a genuinely healthy, well-observed cluster.
-Never treat an empty metrics table as "no change" yourself either, even if summarizing verbally.
+**This is different from insufficient data.** The verdict is `insufficient_data` (confidence low)
+when a node returned no metrics at all, or any **core metric** (CPU user, CPU kernel, memory used,
+memory free, disk space used) is missing. Before this rule, a cluster created ~30 minutes before a
+7-day audit returned an empty table and still reported "no change, confidence: high". Never
+summarize an empty or partial metrics table as "no change".
 
 ## Confidence levels
 
-- **High**: ≥ 7 days of clean data, signal consistent across the whole window, single clear
-  driver.
-- **Medium**: shorter window (3–6 days), or signal present but not on every day, or multiple
-  competing signals.
-- **Low**: < 3 days of data, or metrics near the threshold boundary, or gaps in the data (node
-  restarts, etc.). Say so and suggest re-running with a longer window before acting.
+- **High**: ≥ 7 days, ≥ 90% sample coverage, no missing core metrics; for a scale-up, at least two
+  different triggers agree; for no-change / scale-down, nothing close to a trigger.
+- **Medium**: 3–6 day window, or a scale-up with a single trigger.
+- **Low**: < 3 days, sample coverage < 90% (gaps from restarts, a cluster younger than the window),
+  missing core metrics, or (for no-change / scale-down) a metric close to a trigger. Say which, and
+  suggest re-running with a longer window before acting.
 
-## M-tier reference (vCPU / RAM) — for reasoning about headroom between tiers
+Coverage is the lowest, across nodes, of samples received ÷ samples expected (24 per day at PT1H;
+60 per hour at PT1M) for the core metrics.
 
-Use this to describe *how much* headroom a scale-up/down would add, not just that one is
-recommended. Confirm exact current specs against the Atlas UI or `GET /clusters/{name}` response
-before quoting numbers to a user, since Atlas periodically revises tier specs.
+## Auto-scaling
+
+The cluster's compute and storage auto-scaling settings are read from every region config and
+turned into notes: a manual tier change on an auto-scaling cluster may be overridden, so the report
+points at `minInstanceSize` / `maxInstanceSize` (or enabling scale-down) instead. With storage
+auto-scaling on, a disk-space trigger may resolve itself.
+
+## M-tier reference (vCPU / RAM), for describing headroom between tiers
+
+Confirm current specs in the Atlas UI or the `GET /clusters/{name}` response before quoting numbers,
+since Atlas revises tier specs.
 
 | Tier | vCPU (approx) | RAM (approx) |
 |---|---|---|
@@ -177,7 +176,3 @@ before quoting numbers to a user, since Atlas periodically revises tier specs.
 | M60 | 16 | 64 GB |
 | M80 | 32 | 128 GB |
 | M140/M200/M300 | 64+ | 192 GB+ |
-
-Dedicated tiers (M10+) support independently provisioned IOPS on most cloud providers — a disk
-bottleneck doesn't always require a compute tier change; check whether bumping IOPS alone
-resolves it before recommending a full tier jump.

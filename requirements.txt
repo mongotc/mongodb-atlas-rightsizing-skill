@@ -1,0 +1,3 @@
+requests>=2.20
+# Only needed for scripts/db_diagnostics.py
+pymongo>=4.0

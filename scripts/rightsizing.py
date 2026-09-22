@@ -2,33 +2,35 @@
 """
 MongoDB Atlas rightsizing report.
 
-Pulls hardware measurements for one or more clusters from the Atlas Admin API,
-compares them against tier-appropriate thresholds (see ../references/thresholds.md),
-and writes a human-readable report.md and a machine-readable report.json.
+Pulls hardware measurements for one or more clusters from the Atlas Admin API, evaluates every
+node against the rules in ../references/thresholds.md, and writes report.md (human-readable) and
+report.json (structured; consumed by merge_verdict.py).
 
-Auth (pick one):
-  Service account (preferred):
-    --client-id / --client-secret, or env ATLAS_CLIENT_ID / ATLAS_CLIENT_SECRET
-  API key (legacy, HTTP Digest):
-    --public-key / --private-key, or env ATLAS_PUBLIC_KEY / ATLAS_PRIVATE_KEY
+Auth comes from environment variables only, so secrets never end up in shell history or `ps`:
+  Service account (preferred): ATLAS_CLIENT_ID / ATLAS_CLIENT_SECRET
+  API key (legacy, HTTP Digest): ATLAS_PUBLIC_KEY / ATLAS_PRIVATE_KEY
 
 This script is READ-ONLY. It never modifies a cluster.
 
 Usage:
   python rightsizing.py --group-id <id> --cluster mycluster --days 7 --out-dir ./report
-  python rightsizing.py --group-id <id> --days 30 --out-dir ./report   # all clusters in project
-  python rightsizing.py --group-id <id> --cluster mycluster --hours 2 --out-dir ./report
-      # quick/ad-hoc check of a live situation — always reports 'low' confidence, not a
-      # substitute for the default 7-day audit
+  python rightsizing.py --group-id <id> --days 30 --out-dir ./report     # every cluster in the project
+  python rightsizing.py --config targets.json --out-dir ./report         # several projects/clusters
+  python rightsizing.py --group-id <id> --cluster mycluster --hours 2    # live spot-check, always low confidence
+
+Exit status: 0 on success; 2 if any cluster could not be evaluated because of an Atlas API error
+(the report is still written, with those clusters marked "error").
 
 Only dependency: `requests` (pip install requests).
 """
 
 import argparse
 import json
+import operator
 import os
-import statistics
+import re
 import sys
+import time
 from datetime import datetime, timezone
 
 try:
@@ -38,10 +40,9 @@ except ImportError:
     sys.exit("This script requires the 'requests' package: pip install requests")
 
 ATLAS_BASE = "https://cloud.mongodb.com/api/atlas/v2"
+TOKEN_URL = "https://cloud.mongodb.com/api/oauth/token"
+# Pinned so a newer default API version can't change response shapes underneath the script.
 API_VERSION_HEADER = {"Accept": "application/vnd.atlas.2025-03-12+json"}
-# ^ Pin an API version header per Atlas Admin API versioning practice. Update the date if the
-#   fields this script relies on need a newer schema version. Unversioned requests get the
-#   latest version, which can change response shape without notice.
 
 # Host-level metrics: /groups/{groupId}/processes/{processId}/measurements
 HOST_METRICS = [
@@ -50,184 +51,346 @@ HOST_METRICS = [
     "SYSTEM_MEMORY_USED",
     "SYSTEM_MEMORY_FREE",
     "CONNECTIONS",
-    "TICKETS_AVAILABLE_READS",   # context only — NOT a trigger, see evaluate_cluster() for why
-    "TICKETS_AVAILABLE_WRITE",  # NB: singular "WRITE", unlike the plural "READS" — an Atlas API quirk
-    "GLOBAL_LOCK_CURRENT_QUEUE_READERS",  # ops actually waiting for a concurrency slot — the real trigger
+    "TICKETS_AVAILABLE_READS",            # context only; see thresholds.md "Concurrency queuing"
+    "TICKETS_AVAILABLE_WRITE",            # singular "WRITE" is the real Atlas name
+    "GLOBAL_LOCK_CURRENT_QUEUE_READERS",
     "GLOBAL_LOCK_CURRENT_QUEUE_WRITERS",
-    "OP_EXECUTION_TIME_READS",  # context only — corroborates queuing with actual latency impact
+    "OP_EXECUTION_TIME_READS",            # context only
     "OP_EXECUTION_TIME_WRITES",
-    "EXTRA_INFO_PAGE_FAULTS",   # rate, SCALAR_PER_SECOND: direct evidence WT cache < working set
-    "CACHE_BYTES_READ_INTO",    # rate, BYTES_PER_SECOND: corroborates faults are cache-driven, context only
-    "CACHE_FILL_RATIO",         # units=PERCENT, already 0-100 (NOT a 0-1 fraction) — WT overall cache fill
-    "DIRTY_FILL_RATIO",         # units=PERCENT, already 0-100 — WT dirty (uncheckpointed) bytes in cache
-    "SYSTEM_NORMALIZED_CPU_IOWAIT",  # context only — corroborates disk latency with actual CPU stall time
+    "EXTRA_INFO_PAGE_FAULTS",             # per second
+    "CACHE_BYTES_READ_INTO",              # bytes/sec, context only
+    "CACHE_FILL_RATIO",                   # already 0-100
+    "DIRTY_FILL_RATIO",                   # already 0-100
+    "SYSTEM_NORMALIZED_CPU_IOWAIT",       # context only
 ]
 
 # Disk-level metrics: /groups/{groupId}/processes/{processId}/disks/{partitionName}/measurements
-# (querying these against the process-level /measurements endpoint 404s with INVALID_METRIC_NAME)
 DISK_METRICS = [
     "DISK_PARTITION_IOPS_READ",
     "DISK_PARTITION_IOPS_WRITE",
-    # NOTE: this is disk *capacity* used (bytes/(bytes+free)*100 — verified to match exactly), NOT
-    # I/O busy-time/saturation despite what the name suggests. An earlier version of this script
-    # substituted this in as a stand-in for the literal (404, doesn't exist) "DISK_PARTITION_
-    # UTILIZATION" name and treated it as an I/O-saturation signal in the report text — it isn't
-    # one. Kept as a legitimate disk-space trigger (see evaluate_cluster()), just correctly named.
-    "DISK_PARTITION_SPACE_PERCENT_USED",
+    "DISK_PARTITION_SPACE_PERCENT_USED",  # disk capacity used, NOT I/O busy time
     "DISK_PARTITION_SPACE_USED",
     "DISK_PARTITION_SPACE_FREE",
-    "DISK_PARTITION_LATENCY_READ",     # ms per op — the real "is the disk keeping up" signal
+    "DISK_PARTITION_LATENCY_READ",        # ms per op
     "DISK_PARTITION_LATENCY_WRITE",
-    "DISK_PARTITION_THROUGHPUT_READ",  # bytes/sec — context only, no provisioned-throughput
-    "DISK_PARTITION_THROUGHPUT_WRITE", # ceiling exposed by Atlas to compare against (unlike IOPS)
+    "DISK_PARTITION_THROUGHPUT_READ",     # bytes/sec, context only
+    "DISK_PARTITION_THROUGHPUT_WRITE",
 ]
 
-METRICS = HOST_METRICS + DISK_METRICS
+# Without these a node can't be judged "fine": a missing core metric means insufficient data.
+CORE_HOST_METRICS = (
+    "SYSTEM_NORMALIZED_CPU_USER",
+    "SYSTEM_NORMALIZED_CPU_KERNEL",
+    "SYSTEM_MEMORY_USED",
+    "SYSTEM_MEMORY_FREE",
+)
+CORE_DISK_METRIC = "DISK_PARTITION_SPACE_PERCENT_USED"
 
-TIER_SPECS = {
-    "M10": (2, 2), "M20": (2, 4), "M30": (2, 8), "M40": (4, 16),
-    "M50": (8, 32), "M60": (16, 64), "M80": (32, 128),
-}
+# Scale-up triggers and scale-down ceilings. Keep in sync with references/thresholds.md.
+CPU_UP, CPU_DOWN = 80, 20                        # % (user + kernel)
+MEM_FREE_UP, MEM_FREE_DOWN = 10, 40              # % free, judged on p5 (low end of the window)
+IOPS_UP, IOPS_DOWN = 0.90, 0.50                  # fraction of provisioned IOPS (read + write)
+SPACE_UP, SPACE_DOWN = 90, 50                    # % disk capacity used
+LATENCY_UP, LATENCY_DOWN = 15, 5                 # ms, heuristic
+CONNS_UP, CONNS_DOWN = 0.80, 0.30                # fraction of the tier's per-node limit
+PAGE_FAULTS_UP, PAGE_FAULTS_DOWN = 1.0, 0.5      # per second, heuristic
+CACHE_FILL_UP, CACHE_FILL_DOWN = 80, 50          # % (WT eviction_target)
+DIRTY_FILL_UP, DIRTY_FILL_DOWN = 5, 2            # % (WT eviction_dirty_target)
+IOWAIT_CONTEXT = 5                               # % iowait worth quoting next to a latency trigger
 
-# Max concurrent connections per tier, for the CONNECTIONS trigger below.
-# VERIFICATION STATUS: only M10 has been independently confirmed in this project, by reading
-# db_diagnostics.py's live serverStatus().connections against a real M10 cluster (current=64 +
-# available=1436 = 1500 exactly). The rest are MongoDB's commonly published Atlas tier connection
-# limits, NOT independently re-verified here — Atlas has changed these before, and this session
-# found several other "commonly known" API details that turned out wrong on inspection (metric
-# names, units, ticket semantics). Confirm against a live cluster or
-# https://www.mongodb.com/docs/atlas/reference/free-shared-limitations/ (and the equivalent
-# dedicated-tier limits page) before treating anything but M10 as authoritative.
+NEAR_THRESHOLD = 0.10  # a p95 within 10% of a scale-up trigger is "borderline"
+MIN_COVERAGE = 0.90    # below this fraction of expected samples, the data has gaps
+SUSTAINED_DAYS = 3     # CPU / IOPS / disk space must breach on >= 3 of the last 7 days
+
+DISK_TRIGGERS = {"iops", "disk_space", "disk_latency_read", "disk_latency_write"}
+EVALUATED_VERDICTS = {"scale_up", "disk_iops_only", "scale_down_candidate", "no_change"}
+SHARED_TIERS = {"M0", "M2", "M5", "FLEX", "SERVERLESS"}
+
+# Max concurrent connections per node, from "Connection Limits and Cluster Tier" at
+# https://www.mongodb.com/docs/atlas/reference/atlas-limits/ (checked 2026-09-22). That page has
+# several tables (by cloud provider / cluster class) that disagree for some tiers, e.g. M80 is
+# 96000 in one and 64000 in the others. Stored as (lowest, highest); the check uses the lowest so
+# it errs toward flagging. R-series and _NVME tiers are looked up by their M-number.
 TIER_MAX_CONNECTIONS = {
-    "M10": 1500,   # empirically verified
-    "M20": 3000, "M30": 3000, "M40": 6000, "M50": 16000, "M60": 32000, "M80": 64000,
+    "M10": (1500, 1500), "M20": (3000, 3000), "M30": (3000, 3000), "M40": (4000, 6000),
+    "M50": (16000, 16000), "M60": (32000, 32000), "M80": (64000, 96000), "M140": (96000, 96000),
+    "M200": (128000, 128000), "M300": (128000, 128000), "M400": (128000, 128000),
+    "M600": (128000, 128000), "M700": (128000, 128000),
+}
+
+VERDICT_LABELS = {
+    "scale_up": "SCALE UP",
+    "disk_iops_only": "CHANGE DISK / IOPS ONLY",
+    "scale_down_candidate": "SCALE DOWN CANDIDATE",
+    "no_change": "NO CHANGE",
+    "insufficient_data": "INSUFFICIENT DATA",
+    "not_supported": "NOT SUPPORTED",
+    "not_applicable": "NOT APPLICABLE",
+    "error": "ERROR",
 }
 
 
-def get_session(args):
-    session = requests.Session()
-    session.headers.update(API_VERSION_HEADER)
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    client_id = args.client_id or os.environ.get("ATLAS_CLIENT_ID")
-    client_secret = args.client_secret or os.environ.get("ATLAS_CLIENT_SECRET")
-    public_key = args.public_key or os.environ.get("ATLAS_PUBLIC_KEY")
-    private_key = args.private_key or os.environ.get("ATLAS_PRIVATE_KEY")
 
-    if client_id and client_secret:
-        token = _get_oauth_token(client_id, client_secret)
-        session.headers.update({"Authorization": f"Bearer {token}"})
-    elif public_key and private_key:
-        session.auth = HTTPDigestAuth(public_key, private_key)
-    else:
-        sys.exit(
-            "No credentials found. Provide --client-id/--client-secret or "
-            "--public-key/--private-key (or the matching ATLAS_* env vars)."
+# --------------------------------------------------------------------------------------------
+# Atlas API access
+# --------------------------------------------------------------------------------------------
+
+class AtlasAPIError(Exception):
+    pass
+
+
+class AtlasClient:
+    """requests wrapper: auth (with OAuth token refresh), retry with backoff on 429/5xx,
+    pagination, and failures raised as AtlasAPIError instead of being swallowed."""
+
+    RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+    def __init__(self, session=None, max_retries=5, timeout=30, sleep=time.sleep, env=None):
+        env = os.environ if env is None else env
+        self.session = session or requests.Session()
+        self.session.headers.update(API_VERSION_HEADER)
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self._sleep = sleep
+        self._client_id = env.get("ATLAS_CLIENT_ID")
+        self._client_secret = env.get("ATLAS_CLIENT_SECRET")
+        self._token_expires_at = 0.0
+        public_key, private_key = env.get("ATLAS_PUBLIC_KEY"), env.get("ATLAS_PRIVATE_KEY")
+        if self._uses_oauth():
+            self._refresh_token()
+        elif public_key and private_key:
+            self.session.auth = HTTPDigestAuth(public_key, private_key)
+        else:
+            raise AtlasAPIError(
+                "No credentials found. Set ATLAS_CLIENT_ID/ATLAS_CLIENT_SECRET (service account) "
+                "or ATLAS_PUBLIC_KEY/ATLAS_PRIVATE_KEY (API key) in the environment."
+            )
+
+    def _uses_oauth(self):
+        return bool(self._client_id and self._client_secret)
+
+    def _refresh_token(self):
+        resp = self.session.post(
+            TOKEN_URL,
+            auth=(self._client_id, self._client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"Accept": "application/json"},
+            timeout=self.timeout,
         )
-    return session
+        if not resp.ok:
+            raise AtlasAPIError(f"OAuth token request failed ({resp.status_code}): {resp.text[:300]}")
+        body = resp.json()
+        self.session.headers["Authorization"] = f"Bearer {body['access_token']}"
+        # Service-account tokens last an hour; refresh a minute early so long audits don't 401.
+        self._token_expires_at = time.time() + float(body.get("expires_in", 3600)) - 60
+
+    def _backoff(self, attempt, retry_after):
+        if retry_after:
+            try:
+                return min(float(retry_after), 60.0)
+            except ValueError:
+                pass
+        return min(2 ** attempt, 30)
+
+    def get(self, path, params=None):
+        url = path if path.startswith("http") else f"{ATLAS_BASE}{path}"
+        refreshed_after_401 = False
+        for attempt in range(self.max_retries + 1):
+            if self._uses_oauth() and time.time() >= self._token_expires_at:
+                self._refresh_token()
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as e:
+                if attempt == self.max_retries:
+                    raise AtlasAPIError(f"Network error on {path}: {e}")
+                self._sleep(self._backoff(attempt, None))
+                continue
+            if resp.status_code == 401 and self._uses_oauth() and not refreshed_after_401:
+                self._refresh_token()
+                refreshed_after_401 = True
+                continue
+            if resp.status_code in self.RETRY_STATUSES and attempt < self.max_retries:
+                self._sleep(self._backoff(attempt, resp.headers.get("Retry-After")))
+                continue
+            if not resp.ok:
+                raise AtlasAPIError(f"Atlas API error {resp.status_code} on {path}: {resp.text[:500]}")
+            return resp.json()
+        raise AtlasAPIError(f"Gave up on {path} after {self.max_retries} retries")
+
+    def get_all(self, path, params=None, items_per_page=500):
+        """Follow Atlas pagination and return every item in `results`."""
+        params = dict(params or {})
+        params.update({"itemsPerPage": items_per_page, "includeCount": "true"})
+        items, page = [], 1
+        while True:
+            params["pageNum"] = page
+            data = self.get(path, dict(params))
+            batch = data.get("results", [])
+            items.extend(batch)
+            total = data.get("totalCount")
+            if not batch or len(batch) < items_per_page or (total is not None and len(items) >= total):
+                return items
+            page += 1
 
 
-def _get_oauth_token(client_id, client_secret):
-    resp = requests.post(
-        "https://cloud.mongodb.com/api/oauth/token",
-        auth=(client_id, client_secret),
-        data={"grant_type": "client_credentials"},
-        headers={"Accept": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+def _series(data):
+    """Measurements response -> {metric name: [(timestamp, value), ...]} with nulls dropped."""
+    out = {}
+    for m in data.get("measurements", []):
+        out[m["name"]] = [
+            (dp["timestamp"], dp["value"]) for dp in m.get("dataPoints", []) if dp.get("value") is not None
+        ]
+    return out
 
 
-def api_get(session, path, params=None):
-    resp = session.get(f"{ATLAS_BASE}{path}", params=params, timeout=30)
-    if not resp.ok:
-        sys.exit(f"Atlas API error {resp.status_code} on {path}: {resp.text[:500]}")
-    return resp.json()
+def fetch_node_metrics(client, group_id, process_id, window, host_only=False):
+    """{"host": {metric: series}, "disks": {partition: {metric: series}}} for one process."""
+    base = f"/groups/{group_id}/processes/{process_id}"
+    query = [("granularity", window["granularity"]), ("period", window["period"])]
+    host = _series(client.get(f"{base}/measurements", query + [("m", m) for m in HOST_METRICS]))
+    disks = {}
+    if not host_only:
+        for partition in client.get_all(f"{base}/disks"):
+            name = partition.get("partitionName")
+            if name:
+                disks[name] = _series(client.get(
+                    f"{base}/disks/{name}/measurements", query + [("m", m) for m in DISK_METRICS]
+                ))
+    return {"host": host, "disks": disks}
 
 
-def list_clusters(session, group_id):
-    data = api_get(session, f"/groups/{group_id}/clusters")
-    return data.get("results", [])
+# --------------------------------------------------------------------------------------------
+# Cluster topology
+# --------------------------------------------------------------------------------------------
+
+_HOST_RE = re.compile(r"^(?P<prefix>.+)-(?:shard|config)-\d+-\d+(?P<domain>\..+)$")
 
 
-def get_cluster(session, group_id, cluster_name):
-    return api_get(session, f"/groups/{group_id}/clusters/{cluster_name}")
+def _host_key(name):
+    """'cluster0-shard-00-01.abcde.mongodb.net:27017' -> ('cluster0', '.abcde.mongodb.net')."""
+    m = _HOST_RE.match((name or "").lower().split(":")[0])
+    return (m.group("prefix"), m.group("domain")) if m else None
 
 
-def list_processes_for_cluster(session, group_id, cluster_name):
-    data = api_get(session, f"/groups/{group_id}/processes", params={"itemsPerPage": 500})
-    needle = cluster_name.lower()
-    procs = [
-        p for p in data.get("results", [])
-        if p.get("userAlias", "").lower().startswith(needle)
-        or (p.get("replicaSetName") or "").lower() == needle
-        or needle in p.get("id", "").lower()
-    ]
-    return procs
+def _bare_host(name):
+    return (name or "").lower().split(":")[0]
+
+
+def cluster_host_keys(cluster_cfg):
+    """(prefix, domain) pairs for the hosts in the cluster's standard connection string."""
+    std = (cluster_cfg.get("connectionStrings") or {}).get("standard") or ""
+    if not std:
+        return set()
+    hosts = std.split("://", 1)[-1].split("/", 1)[0].split(",")
+    return {k for k in (_host_key(h) for h in hosts) if k}
+
+
+def process_matches(proc, host_keys, cluster_name):
+    """Exact match on host prefix + domain, so 'prod' never picks up 'prod-analytics' or 'prod2'.
+    Falls back to an exact '<cluster name>-shard-' / '-config-' prefix when the cluster response
+    has no parseable connection string."""
+    keys = [_host_key(proc.get(f)) for f in ("userAlias", "hostname", "id")]
+    keys = [k for k in keys if k]
+    if host_keys:
+        return any(k in host_keys for k in keys)
+    return any(k[0] == cluster_name.lower() for k in keys)
 
 
 def group_processes_by_replica_set(procs):
-    """Split a cluster's processes into per-shard (or single-replica-set) groups, plus routers.
+    """Split a cluster's processes into per-replica-set groups (each shard and the config server
+    is its own replica set) plus mongos routers, which have no replicaSetName.
 
-    Every mongod — whether it's a shard member, a config-server member, or a plain replica-set
-    member — reports a real `replicaSetName`, and each shard IS its own distinct replica set, so
-    grouping by that field reliably separates shard-0's nodes from shard-1's nodes from the config
-    server's nodes, with no assumption about hostname numbering. mongos routers are stateless and
-    don't belong to a replica set, so they have no `replicaSetName`; they're returned separately
-    since they have no local storage/WT cache to evaluate against these thresholds.
-
-    NOTE: this is implemented against the documented Atlas API process schema, not verified against
-    a live sharded cluster (none were available to test against at the time this was written). If
-    you run this against a real sharded cluster, sanity-check the shard grouping in the output
-    against what the Atlas UI shows before trusting the per-shard verdicts.
-    """
-    shard_groups = {}
-    routers = []
+    Implemented against the documented process schema; not yet checked against a live sharded
+    cluster, so compare the shard breakdown with the Atlas UI the first time."""
+    shard_groups, routers = {}, []
     for p in procs:
         rs_name = p.get("replicaSetName")
-        if rs_name:
+        if rs_name and p.get("typeName") != "SHARD_MONGOS":
             shard_groups.setdefault(rs_name, []).append(p)
         else:
             routers.append(p)
     return shard_groups, routers
 
 
-def _fetch_measurements(session, url, metric_names, period, granularity):
-    query = [("granularity", granularity), ("period", period)] + [("m", m) for m in metric_names]
-    resp = session.get(url, params=query, timeout=30)
-    if not resp.ok:
-        return {}
-    data = resp.json()
-    out = {}
-    for m in data.get("measurements", []):
-        values = [dp["value"] for dp in m.get("dataPoints", []) if dp.get("value") is not None]
-        out[m["name"]] = values
-    return out
+def node_label(proc):
+    alias = proc.get("userAlias") or proc.get("hostname") or proc.get("id") or "unknown"
+    short = alias.split(".")[0]
+    port = proc.get("port")
+    return f"{short}:{port}" if port else short
 
 
-def get_measurements(session, group_id, process_id, period, granularity):
-    out = _fetch_measurements(
-        session, f"{ATLAS_BASE}/groups/{group_id}/processes/{process_id}/measurements",
-        HOST_METRICS, period, granularity,
-    )
+def node_hosts(proc):
+    return sorted({_bare_host(proc.get(f)) for f in ("userAlias", "hostname", "id") if proc.get(f)})
 
-    # Disk metrics live under a per-partition sub-resource, not the process-level endpoint.
-    disks_resp = session.get(f"{ATLAS_BASE}/groups/{group_id}/processes/{process_id}/disks", timeout=30)
-    if disks_resp.ok:
-        for partition in disks_resp.json().get("results", []):
-            name = partition.get("partitionName")
-            if not name:
-                continue
-            disk_out = _fetch_measurements(
-                session,
-                f"{ATLAS_BASE}/groups/{group_id}/processes/{process_id}/disks/{name}/measurements",
-                DISK_METRICS, period, granularity,
+
+def normalize_tier(tier):
+    m = re.match(r"^[MR](\d+)", tier or "")
+    return f"M{m.group(1)}" if m else None
+
+
+def tier_info(cluster_cfg):
+    """Tier(s), provisioned IOPS and auto-scaling settings across every region config."""
+    tiers, iops, notes = set(), set(), []
+    autoscaling = {"compute": None, "disk": False}
+    for spec in cluster_cfg.get("replicationSpecs", []):
+        for rc in spec.get("regionConfigs", []):
+            electable = rc.get("electableSpecs") or {}
+            if electable.get("instanceSize"):
+                tiers.add(electable["instanceSize"])
+            if electable.get("diskIOPS") is not None:
+                iops.add(electable["diskIOPS"])
+            for kind in ("readOnlySpecs", "analyticsSpecs"):
+                other = rc.get(kind) or {}
+                if other.get("nodeCount") and other.get("instanceSize") not in (None, electable.get("instanceSize")):
+                    notes.append(
+                        f"{kind[:-5]} nodes run {other['instanceSize']} (electable nodes run "
+                        f"{electable.get('instanceSize')}); they are evaluated against the same thresholds."
+                    )
+            scaling = rc.get("autoScaling") or {}
+            compute = scaling.get("compute") or {}
+            if compute.get("enabled"):
+                autoscaling["compute"] = compute
+            if (scaling.get("diskGB") or {}).get("enabled"):
+                autoscaling["disk"] = True
+    return sorted(tiers) or ["UNKNOWN"], sorted(iops), autoscaling, sorted(set(notes))
+
+
+def autoscaling_notes(autoscaling, verdict, trigger_ids):
+    notes = []
+    compute = autoscaling.get("compute")
+    if compute:
+        span = f"{compute.get('minInstanceSize', '?')}–{compute.get('maxInstanceSize', '?')}"
+        if verdict == "scale_up" and trigger_ids - DISK_TRIGGERS:
+            notes.append(
+                f"Compute auto-scaling is ON ({span}). Atlas scales up by itself under sustained load, "
+                f"so if it hasn't, the cluster may already be at its max tier: raising "
+                f"maxInstanceSize is likely the right change, not a manual tier bump."
             )
-            for k, v in disk_out.items():
-                out.setdefault(k, []).extend(v)
+        elif verdict == "scale_down_candidate":
+            if compute.get("scaleDownEnabled"):
+                notes.append(
+                    f"Compute auto-scaling with scale-down is ON ({span}). Atlas should downsize by itself "
+                    f"and may override a manual change; lower minInstanceSize instead."
+                )
+            else:
+                notes.append(
+                    f"Compute auto-scaling is ON ({span}) but scale-down is disabled: enable scale-down "
+                    f"or lower the tier manually."
+                )
+        else:
+            notes.append(f"Compute auto-scaling is ON ({span}); a manual tier change may be overridden.")
+    if autoscaling.get("disk") and "disk_space" in trigger_ids:
+        notes.append("Storage auto-scaling is ON: Atlas grows the disk automatically as it fills, "
+                     "so the disk-space trigger may resolve itself.")
+    return notes
 
-    return out
 
+# --------------------------------------------------------------------------------------------
+# Statistics
+# --------------------------------------------------------------------------------------------
 
 def pctl(values, p):
     if not values:
@@ -240,10 +403,12 @@ def pctl(values, p):
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-def summarize(values):
+def summarize(points):
+    values = [v for _, v in points or []]
     if not values:
         return None
     return {
+        "p5": round(pctl(values, 0.05), 2),
         "p50": round(pctl(values, 0.5), 2),
         "p95": round(pctl(values, 0.95), 2),
         "max": round(max(values), 2),
@@ -251,399 +416,464 @@ def summarize(values):
     }
 
 
-def evaluate_cluster(cluster_cfg, process_metrics, window_days):
-    """Apply the threshold rules from references/thresholds.md. Returns (verdict, reasons, confidence).
+def combine(a, b, fn):
+    """Join two series on timestamp and apply fn(a_value, b_value)."""
+    b_by_ts = dict(b or [])
+    return [(ts, fn(v, b_by_ts[ts])) for ts, v in a or [] if ts in b_by_ts]
 
-    window_days is the lookback window expressed in days as a float (e.g. a 2-hour window is
-    2/24 = 0.083) so the confidence-level thresholds below apply correctly to sub-day windows too.
-    """
-    agg = {}
-    for metrics in process_metrics.values():
-        for name, values in metrics.items():
-            agg.setdefault(name, []).extend(values)
 
-    summary = {name: summarize(vals) for name, vals in agg.items()}
+def breach_days(points, threshold, last_n_days=7):
+    """How many of the last N UTC days have their own p95 above threshold."""
+    by_day = {}
+    for ts, v in points:
+        by_day.setdefault(ts[:10], []).append(v)
+    recent = sorted(by_day)[-last_n_days:]
+    return sum(1 for day in recent if pctl(by_day[day], 0.95) > threshold)
 
-    # If NOTHING came back — no processes matched, every measurements call returned empty, or the
-    # cluster/shard is simply too new to have any data in the requested window — don't let the
-    # threshold logic below run on an empty summary and fall through to "no thresholds crossed"
-    # with high confidence. That's backwards: no data means no basis for ANY verdict, let alone a
-    # confident one. Confirmed as a real failure mode, not just theoretical: pointing this script
-    # at a cluster created ~30 minutes earlier returned a completely empty metric table but still
-    # reported "confidence: high" before this check was added.
-    if not any(summary.values()):
-        return (
-            "insufficient_data",
-            ["No metrics data available for the requested window — the cluster/shard may be too "
-             "new (check its creation time), paused, or unreachable. Not a basis for any "
-             "scale-up/down/no-change verdict; re-run once it has some operating history."],
-            "low",
-            summary,
-        )
 
-    up_reasons = []
-    cpu = summary.get("SYSTEM_NORMALIZED_CPU_USER")
-    if cpu and cpu["p95"] > 80:
-        up_reasons.append(f"CPU p95 {cpu['p95']}% > 80% threshold")
+def sustained_days_required(window_days):
+    if window_days >= 7:
+        return SUSTAINED_DAYS
+    return max(1, -(-SUSTAINED_DAYS * int(window_days) // 7))
 
-    mem_free = summary.get("SYSTEM_MEMORY_FREE")
-    mem_used = summary.get("SYSTEM_MEMORY_USED")
-    if mem_free and mem_used:
-        total = mem_free["p50"] + mem_used["p50"]
-        if total > 0 and (mem_free["p95"] / total) < 0.10:
-            up_reasons.append("Free memory p95 < 10% of total")
 
-    # thresholds.md has documented this trigger since early in this script's history, but it was
-    # never actually implemented — CONNECTIONS was pulled into the report table with no threshold
-    # logic behind it. See TIER_MAX_CONNECTIONS for verification status of the per-tier ceilings.
-    conns = summary.get("CONNECTIONS")
-    max_conns = cluster_cfg.get("_max_connections")
-    if conns and max_conns and conns["p95"] > 0.8 * max_conns:
-        up_reasons.append(
-            f"Connections p95 {conns['p95']} > 80% of tier's {max_conns} max connections"
-        )
+# --------------------------------------------------------------------------------------------
+# Evaluation
+# --------------------------------------------------------------------------------------------
 
-    for iops_name in ("DISK_PARTITION_IOPS_READ", "DISK_PARTITION_IOPS_WRITE"):
-        iops = summary.get(iops_name)
-        provisioned = cluster_cfg.get("_provisioned_iops")
-        if iops and provisioned and iops["p95"] > 0.9 * provisioned:
-            up_reasons.append(f"{iops_name} p95 {iops['p95']} > 90% of provisioned {provisioned}")
+def evaluate_node(data, ctx):
+    """Apply the thresholds to one node. ctx: provisioned_iops, max_connections, window."""
+    host, disks = data.get("host", {}), data.get("disks", {})
+    window = ctx["window"]
+    triggers, borderline = [], []
+    summary = {name: summarize(pts) for name, pts in host.items()}
 
-    # NB: this is disk SPACE capacity used, not I/O busy-time/saturation — see DISK_METRICS
-    # comment. Still a legitimate trigger (running out of disk space is a real problem), just
-    # named for what it actually measures rather than implying an I/O-saturation signal.
-    space_used = summary.get("DISK_PARTITION_SPACE_PERCENT_USED")
-    if space_used and space_used["p95"] > 90:
-        up_reasons.append(f"Disk space used p95 {space_used['p95']}% > 90% of capacity")
+    def check_high(tid, label, points, threshold, unit="", sustained=False, threshold_text=None, suffix=""):
+        s = summarize(points)
+        if not s:
+            return None
+        limit = threshold_text or f"{round(threshold, 2)}{unit}"
+        if s["p95"] > threshold:
+            if sustained:
+                days = breach_days(points, threshold)
+                need = sustained_days_required(window["days"])
+                if days < need:
+                    borderline.append(
+                        f"{label} p95 {s['p95']}{unit} > {limit}, but only on {days} day(s) "
+                        f"(needs {need} to count as sustained)"
+                    )
+                    return s
+                triggers.append({"id": tid, "text": f"{label} p95 {s['p95']}{unit} > {limit}, on {days} day(s){suffix}"})
+            else:
+                triggers.append({"id": tid, "text": f"{label} p95 {s['p95']}{unit} > {limit}{suffix}"})
+        elif s["p95"] >= threshold * (1 - NEAR_THRESHOLD):
+            borderline.append(f"{label} p95 {s['p95']}{unit} is within {int(NEAR_THRESHOLD * 100)}% of the {limit} trigger")
+        return s
 
-    # Real I/O-saturation signal: per-operation latency. Unlike IOPS, there's no Atlas-exposed
-    # "provisioned throughput" ceiling to compare DISK_PARTITION_THROUGHPUT_READ/WRITE against, so
-    # those are pulled for context only; latency is what actually degrades query performance and
-    # needs no ceiling to be meaningful. The 15ms cutoff is a heuristic (not derived from MongoDB/
-    # Atlas documentation), same treatment as the page-fault threshold — tune to your own baseline.
-    for label, latency_name, throughput_name in (
-        ("read", "DISK_PARTITION_LATENCY_READ", "DISK_PARTITION_THROUGHPUT_READ"),
-        ("write", "DISK_PARTITION_LATENCY_WRITE", "DISK_PARTITION_THROUGHPUT_WRITE"),
-    ):
-        latency = summary.get(latency_name)
-        if latency and latency["p95"] > 15:
-            throughput = summary.get(throughput_name)
-            iowait = summary.get("SYSTEM_NORMALIZED_CPU_IOWAIT")
-            corroboration = []
-            if throughput and throughput["p95"] > 0:
-                corroboration.append(f"{throughput_name} p95 {throughput['p95']} B/s")
-            if iowait and iowait["p95"] > 5:
-                corroboration.append(f"CPU iowait p95 {iowait['p95']}%")
-            note = f" ({', '.join(corroboration)} corroborate)" if corroboration else ""
-            up_reasons.append(
-                f"Disk {label} latency p95 {latency['p95']}ms > 15ms heuristic{note}"
-            )
+    cpu_pts = combine(host.get("SYSTEM_NORMALIZED_CPU_USER"), host.get("SYSTEM_NORMALIZED_CPU_KERNEL"), operator.add)
+    cpu = check_high("cpu", "CPU (user+kernel)", cpu_pts, CPU_UP, "%", sustained=True)
+    summary["CPU_USER_PLUS_KERNEL"] = cpu
 
-    # TICKETS_AVAILABLE_READS/WRITE are pulled for context (below) but are NOT a trigger. On
-    # MongoDB 7.0+, WiredTiger's execution control dynamically resizes the concurrency ticket
-    # pool based on observed throughput, replacing the old static 128/128 pool. A low "tickets
-    # available" reading no longer reliably means exhaustion — it can just as easily mean the
-    # algorithm sized the pool small because the workload is genuinely light. Confirmed on this
-    # skill's own test cluster: TICKETS_AVAILABLE_READS held at p50=4 for a week while
-    # GLOBAL_LOCK_CURRENT_QUEUE_READERS stayed at p95=0/max=0 the entire time — i.e. nothing was
-    # ever actually waiting. Queue depth is what changed: it measures the real symptom (ops
-    # waiting for a concurrency slot) rather than an internal, version-dependent pool-sizing
-    # artifact, and it means the same thing on MongoDB 6.x's static pool as on 7.0+'s dynamic one.
-    queue_r = summary.get("GLOBAL_LOCK_CURRENT_QUEUE_READERS")
-    queue_w = summary.get("GLOBAL_LOCK_CURRENT_QUEUE_WRITERS")
-    for label, q in (("read", queue_r), ("write", queue_w)):
+    mem_pts = [
+        (ts, v) for ts, v in combine(
+            host.get("SYSTEM_MEMORY_FREE"), host.get("SYSTEM_MEMORY_USED"),
+            lambda free, used: 100.0 * free / (free + used) if free + used > 0 else None,
+        ) if v is not None
+    ]
+    mem = summarize(mem_pts)
+    summary["MEMORY_FREE_PCT"] = mem
+    if mem:
+        if mem["p5"] < MEM_FREE_UP:
+            triggers.append({"id": "memory", "text": f"Free memory p5 {mem['p5']}% < {MEM_FREE_UP}% (low for at least 5% of the window)"})
+        elif mem["p5"] <= MEM_FREE_UP * (1 + NEAR_THRESHOLD):
+            borderline.append(f"Free memory p5 {mem['p5']}% is within {int(NEAR_THRESHOLD * 100)}% of the {MEM_FREE_UP}% trigger")
+
+    conns = summarize(host.get("CONNECTIONS"))
+    limit = ctx.get("max_connections")
+    if conns and limit:
+        low, high = limit
+        limit_text = str(low) if low == high else f"{low} (the docs list {low}–{high} for this tier by provider/class)"
+        check_high("connections", "Connections", host["CONNECTIONS"], CONNS_UP * low,
+                   threshold_text=f"{int(CONNS_UP * 100)}% of the tier's {limit_text} max per node")
+
+    for label, name in (("read", "READERS"), ("write", "WRITERS")):
+        q = summarize(host.get(f"GLOBAL_LOCK_CURRENT_QUEUE_{name}"))
         if q and q["p95"] > 0:
-            exec_time = summary.get(f"OP_EXECUTION_TIME_{label.upper()}S")
-            corroboration = (
-                f", OP_EXECUTION_TIME_{label.upper()}S p95 {exec_time['p95']}ms corroborates latency impact"
-                if exec_time and exec_time["p95"] > 0 else ""
-            )
-            up_reasons.append(
-                f"{label.capitalize()} concurrency queue p95 {q['p95']} > 0 — operations are "
-                f"actually waiting for a WiredTiger ticket, not just a low available count{corroboration}"
-            )
+            exec_time = summarize(host.get(f"OP_EXECUTION_TIME_{label.upper()}S"))
+            extra = (f"; OP_EXECUTION_TIME_{label.upper()}S p95 {exec_time['p95']}ms"
+                     if exec_time and exec_time["p95"] > 0 else "")
+            triggers.append({"id": f"queue_{label}", "text": (
+                f"{label.capitalize()} concurrency queue p95 {q['p95']} > 0: operations are waiting "
+                f"for a WiredTiger ticket{extra}")})
 
-    # Not in the original skill's thresholds.md — added as a heuristic (see references/thresholds.md
-    # "WiredTiger cache pressure" section). Page faults/sec is cheap on Atlas's SSD-backed storage, so
-    # this is intentionally sensitive; treat a lone trigger here as weaker evidence than CPU/IOPS/disk,
-    # and note whether CACHE_BYTES_READ_INTO also elevated (context, not itself a trigger).
-    page_faults = summary.get("EXTRA_INFO_PAGE_FAULTS")
-    if page_faults and page_faults["p95"] > 1.0:
-        cache_read = summary.get("CACHE_BYTES_READ_INTO")
-        corroboration = (
-            f", CACHE_BYTES_READ_INTO p95 {cache_read['p95']} B/s corroborates cache misses"
-            if cache_read and cache_read["p95"] > 0 else ""
-        )
-        up_reasons.append(
-            f"Page faults p95 {page_faults['p95']}/sec > 1.0/sec heuristic — WiredTiger cache may be "
-            f"undersized for the working set{corroboration}"
-        )
-
-    # WiredTiger eviction thresholds (see references/thresholds.md "WiredTiger eviction thresholds").
-    # eviction_target/eviction_dirty_target (80%/5%) are the point where WT's *background* eviction
-    # threads start working to bring usage back down — not yet the harder eviction_trigger/
-    # eviction_dirty_trigger (95%/20%) point where application threads get recruited to evict. Using
-    # the target (not trigger) values here means this fires earlier/more sensitively, on the
-    # assumption that sustained background-eviction pressure is itself worth flagging before it
-    # escalates to the fully pressured state.
-    cache_fill = summary.get("CACHE_FILL_RATIO")
-    if cache_fill and cache_fill["p95"] > 80:
-        up_reasons.append(
-            f"Cache fill ratio p95 {cache_fill['p95']}% > 80% (eviction_target) — "
-            f"background eviction likely running continuously"
-        )
-
-    dirty_fill = summary.get("DIRTY_FILL_RATIO")
-    if dirty_fill and dirty_fill["p95"] > 5:
-        up_reasons.append(
-            f"Dirty fill ratio p95 {dirty_fill['p95']}% > 5% (eviction_dirty_target) — "
-            f"dirty-page eviction likely running continuously"
-        )
-
-    latency_r = summary.get("DISK_PARTITION_LATENCY_READ")
-    latency_w = summary.get("DISK_PARTITION_LATENCY_WRITE")
-
-    down_ok = (
-        cpu and cpu["p95"] < 20
-        and mem_free and mem_used and (mem_free["p50"] / max(mem_free["p50"] + mem_used["p50"], 1)) > 0.40
-        and (not space_used or space_used["p95"] < 50)
-        and (not page_faults or page_faults["p95"] < 0.5)
-        and (not cache_fill or cache_fill["p95"] < 50)
-        and (not dirty_fill or dirty_fill["p95"] < 2)
-        and (not queue_r or queue_r["max"] == 0)
-        and (not queue_w or queue_w["max"] == 0)
-        and (not latency_r or latency_r["p95"] < 5)
-        and (not latency_w or latency_w["p95"] < 5)
-        and (not conns or not max_conns or conns["p95"] < 0.3 * max_conns)
-        and window_days >= 7
+    cache_read = summarize(host.get("CACHE_BYTES_READ_INTO"))
+    page_faults = check_high(
+        "page_faults", "Page faults", host.get("EXTRA_INFO_PAGE_FAULTS"), PAGE_FAULTS_UP, "/sec",
+        suffix=(f" (CACHE_BYTES_READ_INTO p95 {cache_read['p95']} B/s)" if cache_read and cache_read["p95"] > 0 else "")
+        + ": WiredTiger cache may be undersized for the working set",
     )
+    cache_fill = check_high("cache_fill", "Cache fill ratio", host.get("CACHE_FILL_RATIO"), CACHE_FILL_UP, "%",
+                            suffix=" (eviction_target): background eviction likely running continuously")
+    dirty_fill = check_high("dirty_fill", "Dirty fill ratio", host.get("DIRTY_FILL_RATIO"), DIRTY_FILL_UP, "%",
+                            suffix=" (eviction_dirty_target): dirty-page eviction likely running continuously")
+    queues = [summarize(host.get(f"GLOBAL_LOCK_CURRENT_QUEUE_{n}")) for n in ("READERS", "WRITERS")]
 
-    if up_reasons:
-        verdict = "scale_up"
-        reasons = up_reasons
-    elif down_ok:
+    iowait = summarize(host.get("SYSTEM_NORMALIZED_CPU_IOWAIT"))
+    prov = ctx.get("provisioned_iops")
+    disk_down = []
+    for part, m in sorted(disks.items()):
+        for name, pts in m.items():
+            summary[f"{name}[{part}]"] = summarize(pts)
+        iops_pts = combine(m.get("DISK_PARTITION_IOPS_READ"), m.get("DISK_PARTITION_IOPS_WRITE"), operator.add)
+        iops = summarize(iops_pts)
+        summary[f"DISK_PARTITION_IOPS_TOTAL[{part}]"] = iops
+        if prov:
+            check_high("iops", f"Disk IOPS read+write [{part}]", iops_pts, IOPS_UP * prov, sustained=True,
+                       threshold_text=f"{int(IOPS_UP * 100)}% of provisioned {prov}")
+        space = check_high("disk_space", f"Disk space used [{part}]", m.get(CORE_DISK_METRIC), SPACE_UP, "%",
+                           sustained=True)
+        latencies = []
+        for label in ("read", "write"):
+            throughput = summarize(m.get(f"DISK_PARTITION_THROUGHPUT_{label.upper()}"))
+            context = []
+            if throughput and throughput["p95"] > 0:
+                context.append(f"throughput p95 {throughput['p95']} B/s")
+            if iowait and iowait["p95"] > IOWAIT_CONTEXT:
+                context.append(f"CPU iowait p95 {iowait['p95']}%")
+            latencies.append(check_high(
+                f"disk_latency_{label}", f"Disk {label} latency [{part}]", m.get(f"DISK_PARTITION_LATENCY_{label.upper()}"),
+                LATENCY_UP, "ms", threshold_text=f"{LATENCY_UP}ms heuristic",
+                suffix=f" ({', '.join(context)})" if context else "",
+            ))
+        disk_down.append(
+            space is not None and space["p95"] < SPACE_DOWN
+            and (not prov or not iops or iops["p95"] < IOPS_DOWN * prov)
+            and all(lat is None or lat["p95"] < LATENCY_DOWN for lat in latencies)
+        )
+
+    missing = [m for m in CORE_HOST_METRICS if not host.get(m)]
+    if not any(m.get(CORE_DISK_METRIC) for m in disks.values()):
+        missing.append(CORE_DISK_METRIC)
+
+    core_series = [host.get(m) or [] for m in CORE_HOST_METRICS]
+    core_series += [m.get(CORE_DISK_METRIC) or [] for m in disks.values()] or [[]]
+    expected = window["expected_samples"]
+    coverage = min(min(len(s) / expected, 1.0) for s in core_series) if expected else 0.0
+
+    down_checks = {
+        "cpu": bool(cpu and cpu["p95"] < CPU_DOWN),
+        "memory": bool(mem and mem["p5"] > MEM_FREE_DOWN),
+        "disk": bool(disk_down) and all(disk_down),
+        "page_faults": page_faults is None or page_faults["p95"] < PAGE_FAULTS_DOWN,
+        "cache_fill": cache_fill is None or cache_fill["p95"] < CACHE_FILL_DOWN,
+        "dirty_fill": dirty_fill is None or dirty_fill["p95"] < DIRTY_FILL_DOWN,
+        "queues": all(q is None or q["max"] == 0 for q in queues),
+        "connections": not conns or not limit or conns["p95"] < CONNS_DOWN * limit[0],
+    }
+    return {
+        "triggers": triggers,
+        "borderline": borderline,
+        "down_checks": down_checks,
+        "summary": summary,
+        "coverage": round(coverage, 3),
+        "missing": missing,
+    }
+
+
+def confidence_for(verdict, trigger_ids, window_days, coverage, borderline, missing):
+    if verdict == "insufficient_data" or window_days < 3 or coverage < MIN_COVERAGE or missing:
+        return "low"
+    if verdict in ("scale_up", "disk_iops_only"):
+        if window_days < 7 or len(trigger_ids) < 2:
+            return "medium"
+        return "high"
+    if borderline:
+        return "low"
+    return "medium" if window_days < 7 else "high"
+
+
+def evaluate_group(nodes, ctx):
+    """Evaluate every node (a replica set or one shard) and combine: the group is judged by its
+    worst node, so a hot primary can't be averaged away by idle secondaries.
+
+    nodes: [{"label", "role", "hosts", "data"}]. Returns a partial result dict."""
+    window = ctx["window"]
+    evaluated = [(n, evaluate_node(n["data"], ctx)) for n in nodes]
+    node_rows = [
+        {"node": n["label"], "role": n.get("role"), "hosts": n.get("hosts", []),
+         "coverage": r["coverage"], "metric_summary": r["summary"]}
+        for n, r in evaluated
+    ]
+
+    if not evaluated or not any(any(v for v in r["summary"].values()) for _, r in evaluated):
+        return {
+            "verdict": "insufficient_data", "confidence": "low", "triggers": [], "borderline": [],
+            "reasons": ["No metrics were returned for the requested window: no processes matched, or the "
+                        "cluster is too new (check its creation time), paused, or unreachable. Not a basis "
+                        "for any verdict; re-run once it has some operating history."],
+            "coverage": 0.0, "nodes": node_rows, "notes": [],
+        }
+
+    triggers, borderline, notes = [], [], []
+    for n, r in evaluated:
+        triggers += [{"id": t["id"], "node": n["label"], "text": f"{n['label']}: {t['text']}"} for t in r["triggers"]]
+        borderline += [f"{n['label']}: {b}" for b in r["borderline"]]
+        if r["missing"]:
+            notes.append(f"{n['label']}: missing core metrics {', '.join(r['missing'])}")
+    missing = any(r["missing"] for _, r in evaluated)
+    coverage = min(r["coverage"] for _, r in evaluated)
+    trigger_ids = {t["id"] for t in triggers}
+
+    if coverage < MIN_COVERAGE:
+        notes.append(
+            f"Data coverage is {coverage:.0%} of the expected samples for the lowest node/metric (gaps from "
+            f"restarts, a cluster younger than the window, or missing data)."
+        )
+
+    if triggers:
+        verdict = "disk_iops_only" if trigger_ids <= DISK_TRIGGERS else "scale_up"
+        reasons = [t["text"] for t in triggers]
+        if verdict == "disk_iops_only":
+            reasons.append("Only disk signals fired: check whether more IOPS or disk (not a compute tier "
+                           "change) resolves it.")
+    elif missing:
+        verdict = "insufficient_data"
+        reasons = ["Core metrics (CPU, memory or disk space) are missing for at least one node, so there is "
+                   "no basis for a no-change or scale-down verdict."]
+    elif (all(all(r["down_checks"].values()) for _, r in evaluated)
+          and window["days"] >= 7 and coverage >= MIN_COVERAGE and not borderline):
         verdict = "scale_down_candidate"
-        reasons = ["CPU, memory, and disk all comfortably under scale-down thresholds"]
+        reasons = ["Every node is comfortably under all scale-down limits (CPU, memory, disk space, IOPS, "
+                   "latency, cache, queues, connections)."]
     else:
         verdict = "no_change"
-        reasons = ["No thresholds crossed; metrics are in the comfortable mid-range"]
+        reasons = ["No scale-up thresholds crossed."]
+        if borderline:
+            reasons = ["No scale-up thresholds crossed, but some metrics are close to a trigger (see below)."]
 
-    if window_days >= 7 and len(reasons) >= 1 and (not up_reasons or len(up_reasons) >= 2):
-        confidence = "high"
-    elif window_days >= 3:
-        confidence = "medium"
+    if verdict == "scale_down_candidate" and not ctx.get("provisioned_iops"):
+        notes.append("IOPS headroom was not checked: the cluster config doesn't report provisioned diskIOPS.")
+
+    return {
+        "verdict": verdict,
+        "confidence": confidence_for(verdict, trigger_ids, window["days"], coverage, borderline, missing),
+        "triggers": sorted(trigger_ids),
+        "reasons": reasons,
+        "borderline": borderline,
+        "notes": notes,
+        "coverage": round(coverage, 3),
+        "nodes": node_rows,
+    }
+
+
+def evaluate_cluster(client, group_id, name, window, processes):
+    """Evaluate one cluster. Returns a list of results (one per replica set / shard, plus routers)."""
+    cfg = client.get(f"/groups/{group_id}/clusters/{name}")
+    tiers, iops_values, autoscaling, tier_notes = tier_info(cfg)
+    tier_display = tiers[0] if len(tiers) == 1 else "mixed: " + ", ".join(tiers)
+    base = {"group_id": group_id, "cluster_name": name, "current_tier": tier_display}
+
+    if len(tiers) == 1 and tiers[0] in SHARED_TIERS:
+        return [dict(base, cluster=name, verdict="not_supported", confidence="n/a", triggers=[],
+                     reasons=["Free/shared/flex tiers don't expose full hardware measurements."],
+                     borderline=[], notes=[], coverage=None, nodes=[])]
+
+    notes = list(tier_notes)
+    max_connections = None
+    if len(tiers) == 1:
+        max_connections = TIER_MAX_CONNECTIONS.get(normalize_tier(tiers[0]))
+        if not max_connections:
+            notes.append(f"Connections check skipped: no known connection limit for tier {tiers[0]}.")
     else:
-        confidence = "low"
+        notes.append("Connections check skipped: shards run different tiers, so there is no single limit.")
 
-    return verdict, reasons, confidence, summary
-
-
-def evaluate_process_group(session, group_id, procs, cfg, period, granularity, window_days):
-    """Fetch measurements for one group of processes (a shard, a config-server RS, or a whole
-    non-sharded cluster) and run it through evaluate_cluster(). This is the same fetch+evaluate
-    logic main() used to run once per cluster; factored out so it can run once per shard too."""
-    process_metrics = {}
-    for p in procs:
-        pid = p.get("id")
-        if pid:
-            process_metrics[pid] = get_measurements(session, group_id, pid, period, granularity)
-    return evaluate_cluster(cfg, process_metrics, window_days)
-
-
-def evaluate_router_group(session, group_id, procs, period, granularity):
-    """mongos routers have no local storage or WiredTiger cache, so the scale-up/down thresholds
-    in evaluate_cluster() (disk, tickets, cache fill, etc.) don't apply to them — evaluating a
-    router's CPU/connections against the same rules would conflate router capacity with shard
-    capacity. Report their host-level metrics for visibility, but skip a scored verdict entirely.
-
-    NOT verified against a live sharded cluster — see group_processes_by_replica_set()'s docstring.
-    """
-    agg = {}
-    for p in procs:
-        pid = p.get("id")
-        if not pid:
-            continue
-        m = _fetch_measurements(
-            session, f"{ATLAS_BASE}/groups/{group_id}/processes/{pid}/measurements",
-            HOST_METRICS, period, granularity,
+    provisioned_iops = iops_values[0] if len(iops_values) == 1 else None
+    if len(iops_values) > 1:
+        notes.append(
+            f"IOPS check skipped: shards have different provisioned IOPS ({', '.join(map(str, iops_values))}) "
+            f"and shard-to-replica-set mapping isn't confirmed; check IOPS headroom per shard in the Atlas UI."
         )
-        for name, values in m.items():
-            agg.setdefault(name, []).extend(values)
-    summary = {name: summarize(vals) for name, vals in agg.items()}
-    return summary
+    elif not iops_values:
+        notes.append("IOPS check skipped: the cluster config doesn't report provisioned diskIOPS.")
+
+    host_keys = cluster_host_keys(cfg)
+    procs = [p for p in processes if process_matches(p, host_keys, name)]
+    shard_groups, routers = group_processes_by_replica_set(procs)
+    ctx = {"window": window, "provisioned_iops": provisioned_iops, "max_connections": max_connections}
+
+    def nodes_for(group, host_only=False):
+        return [{
+            "label": node_label(p), "role": p.get("typeName"), "hosts": node_hosts(p),
+            "data": fetch_node_metrics(client, group_id, p["id"], window, host_only=host_only),
+        } for p in group if p.get("id")]
+
+    results = []
+    groups = sorted(shard_groups.items()) or [(None, [])]
+    for rs_name, group in groups:
+        evaluation = evaluate_group(nodes_for(group), ctx)
+        evaluation["notes"] = notes + evaluation["notes"] + autoscaling_notes(
+            autoscaling, evaluation["verdict"], set(evaluation["triggers"]))
+        if not procs:
+            evaluation["notes"].append(
+                "No processes matched this cluster's hostnames; check the cluster name and that the API "
+                "key can see the project's processes.")
+        display = name if len(shard_groups) <= 1 and not routers else f"{name} — replica set {rs_name}"
+        results.append(dict(base, cluster=display, **evaluation))
+
+    if routers:
+        router_nodes = nodes_for(routers, host_only=True)
+        results.append(dict(
+            base, cluster=f"{name} — mongos routers ({len(routers)})", verdict="not_applicable",
+            confidence="n/a", triggers=[], borderline=[], notes=[], coverage=None,
+            reasons=["mongos routers have no local storage or WiredTiger cache: shown for visibility only, "
+                     "not evaluated against the rightsizing thresholds."],
+            nodes=[{"node": n["label"], "role": n["role"], "hosts": n["hosts"], "coverage": None,
+                    "metric_summary": {k: summarize(v) for k, v in n["data"]["host"].items()}}
+                   for n in router_nodes],
+        ))
+    return results
 
 
-def build_report(group_id, results, window_label):
-    lines = [f"# Atlas Rightsizing Report", "",
-             f"Project: `{group_id}`  |  Lookback: {window_label}  |  "
-             f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z", ""]
+# --------------------------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------------------------
+
+def build_report(results, window):
+    lines = ["# Atlas Rightsizing Report", "",
+             f"Lookback: {window['label']} (granularity {window['granularity']})  |  Generated: {utc_now()}", ""]
     for r in results:
         lines.append(f"## {r['cluster']}  —  {r['current_tier']}")
-        lines.append(f"**Verdict: {r['verdict'].replace('_', ' ').upper()}**  (confidence: {r['confidence']})")
+        lines.append(f"Project `{r['group_id']}`")
         lines.append("")
-        for reason in r["reasons"]:
-            lines.append(f"- {reason}")
+        lines.append(f"**Verdict: {VERDICT_LABELS.get(r['verdict'], r['verdict'])}**  (confidence: {r['confidence']})")
         lines.append("")
-        lines.append("| Metric | p50 | p95 | max | samples |")
-        lines.append("|---|---|---|---|---|")
-        for name, s in r["metric_summary"].items():
-            if s:
-                lines.append(f"| {name} | {s['p50']} | {s['p95']} | {s['max']} | {s['n']} |")
+        lines += [f"- {reason}" for reason in r["reasons"]]
+        if r.get("borderline"):
+            lines += ["", "**Close to a trigger:**"] + [f"- {b}" for b in r["borderline"]]
+        if r.get("notes"):
+            lines += ["", "**Notes:**"] + [f"- {n}" for n in r["notes"]]
+        if r.get("coverage") is not None:
+            lines += ["", f"Data coverage: {r['coverage']:.0%} of expected samples (lowest node/core metric)."]
         lines.append("")
+        for node in r.get("nodes", []):
+            rows = [(k, s) for k, s in node["metric_summary"].items() if s]
+            if not rows:
+                continue
+            lines.append(f"### {node['node']}" + (f" ({node['role']})" if node.get("role") else ""))
+            lines.append("")
+            lines.append("| Metric | p5 | p50 | p95 | max | samples |")
+            lines.append("|---|---|---|---|---|---|")
+            lines += [f"| {k} | {s['p5']} | {s['p50']} | {s['p95']} | {s['max']} | {s['n']} |" for k, s in rows]
+            lines.append("")
     lines.append("---")
-    lines.append("This is a read-only recommendation. No cluster was modified. Verify thresholds")
-    lines.append("against your own risk tolerance before acting — see references/thresholds.md.")
+    lines.append("This is a read-only recommendation. No cluster was modified. Node roles are as of report time.")
+    lines.append("Verify thresholds against your own risk tolerance before acting (references/thresholds.md).")
     return "\n".join(lines)
 
 
-def main():
+# --------------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------------
+
+def build_window(days=None, hours=None):
+    if hours is not None:
+        if hours < 1:
+            raise ValueError("--hours must be a whole number >= 1")
+        # Atlas keeps 1-minute data for roughly 38 hours (observed); PT1M shows short spikes that
+        # coarser buckets average away. Longer ad-hoc windows fall back to hourly data.
+        granularity = "PT1M" if hours <= 36 else "PT1H"
+        return {
+            "days": hours / 24, "label": f"{hours} hours", "period": f"PT{hours}H", "granularity": granularity,
+            "expected_samples": hours * 60 if granularity == "PT1M" else hours,
+        }
+    days = 7 if days is None else days
+    if days < 1:
+        raise ValueError("--days must be a whole number >= 1")
+    return {"days": float(days), "label": f"{days} days", "period": f"P{days}D", "granularity": "PT1H",
+            "expected_samples": days * 24}
+
+
+def load_targets(args):
+    """[(group_id, cluster or None)] plus days/hours, from --config and/or CLI flags (CLI wins)."""
+    days, hours, targets = args.days, args.hours, []
+    if args.config:
+        with open(args.config, encoding="utf-8") as f:
+            cfg = json.load(f)
+        days = days if days is not None else cfg.get("days")
+        hours = hours if hours is not None else cfg.get("hours")
+        targets = [(t["group_id"], t.get("cluster")) for t in cfg.get("targets", [])]
+    if args.group_id:
+        targets.append((args.group_id, args.cluster))
+    if not targets:
+        raise ValueError("Give --group-id (optionally with --cluster) or --config with at least one target")
+    return targets, days, hours
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--group-id", required=True, help="Atlas project (group) ID")
+    ap.add_argument("--group-id", help="Atlas project (group) ID")
     ap.add_argument("--cluster", help="Cluster name; omit to audit every cluster in the project")
-    ap.add_argument("--days", type=float, default=7,
-                     help="Lookback window in days (default 7). Ignored if --hours is given.")
-    ap.add_argument("--hours", type=float, default=None,
-                     help="Lookback window in hours, for quick/ad-hoc checks (e.g. --hours 2). "
-                          "Overrides --days. Windows under 3 days always report 'low' confidence "
-                          "(see references/thresholds.md) — this is for spot-checking a live "
-                          "situation, not a substitute for the default 7-day audit.")
+    ap.add_argument("--config", help="JSON file with several targets (see config.example.json)")
+    ap.add_argument("--days", type=int, default=None, help="Lookback window in whole days (default 7)")
+    ap.add_argument("--hours", type=int, default=None,
+                    help="Lookback in whole hours for a live spot-check; overrides --days and always "
+                         "reports low confidence")
     ap.add_argument("--out-dir", default="./rightsizing-report", help="Output directory")
-    ap.add_argument("--client-id"); ap.add_argument("--client-secret")
-    ap.add_argument("--public-key"); ap.add_argument("--private-key")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    if args.hours is not None:
-        window_days = args.hours / 24
-        period = f"PT{args.hours:g}H"
-        # Atlas only retains PT1M (1-minute) resolution for ~38-48h back — beyond that it's
-        # already rolled up, so requesting PT1M for a longer window would silently return nulls
-        # for the older portion. Use the finest resolution Atlas actually has for the window:
-        # PT1M captures true instantaneous peaks (coarser granularities average within each
-        # bucket and can hide brief spikes — e.g. a queue depth that briefly hit 6 read back as
-        # max 2.4 at PT5M and max 1 at PT1H over the same window). Stay a margin under the
-        # observed ~38h cutoff to be safe.
-        # (Only PT1M's retention window was actually verified against the live API — see the
-        # check above. Not asserting a specific retention cutoff for PT5M, so anything beyond the
-        # verified PT1M window falls back to PT1H rather than guessing at an untested boundary.)
-        granularity = "PT1M" if args.hours <= 36 else "PT1H"
-        window_label = f"{args.hours:g} hours"
-    else:
-        window_days = args.days
-        period = f"P{args.days:g}D"
-        granularity = "PT1H"
-        window_label = f"{args.days:g} days"
+    try:
+        targets, days, hours = load_targets(args)
+        window = build_window(days, hours)
+    except (ValueError, OSError, KeyError) as e:
+        ap.error(str(e))
 
-    session = get_session(args)
-    os.makedirs(args.out_dir, exist_ok=True)
+    try:
+        client = AtlasClient()
+    except AtlasAPIError as e:
+        sys.exit(str(e))
 
-    cluster_names = [args.cluster] if args.cluster else [
-        c["name"] for c in list_clusters(session, args.group_id)
-    ]
-
-    results = []
-    for name in cluster_names:
-        cfg = get_cluster(session, args.group_id, name)
-
-        # replicationSpecs has one entry per shard for a SHARDED cluster, one entry total for a
-        # REPLICASET — so this works unmodified for either topology. Atlas supports per-shard
-        # ("asymmetric") tiers, so don't assume a single tier: report the full set, and flag it
-        # explicitly if shards are mixed.
-        specs = cfg.get("replicationSpecs", [])
-        tiers = sorted({
-            spec.get("regionConfigs", [{}])[0].get("electableSpecs", {}).get("instanceSize", "UNKNOWN")
-            for spec in specs
-        }) or ["UNKNOWN"]
-        tier_display = tiers[0] if len(tiers) == 1 else "mixed: " + ", ".join(tiers)
-        # Same "single value or skip" logic as provisioned IOPS below — a mixed-tier sharded
-        # cluster has no single ceiling to compare a pooled CONNECTIONS reading against.
-        max_connections = TIER_MAX_CONNECTIONS.get(tiers[0]) if len(tiers) == 1 else None
-
-        if len(tiers) == 1 and tiers[0] in ("M0", "M2", "M5"):
-            results.append({
-                "cluster": name, "current_tier": tier_display, "verdict": "not_supported",
-                "reasons": ["Free/shared tier does not expose full hardware measurements"],
-                "confidence": "n/a", "metric_summary": {},
-            })
+    results, process_cache = [], {}
+    for group_id, cluster in targets:
+        try:
+            names = [cluster] if cluster else [c["name"] for c in client.get_all(f"/groups/{group_id}/clusters")]
+            if group_id not in process_cache:
+                process_cache[group_id] = client.get_all(f"/groups/{group_id}/processes")
+        except AtlasAPIError as e:
+            results.append(error_result(group_id, cluster or "(all clusters)", e))
             continue
+        for name in names:
+            try:
+                results += evaluate_cluster(client, group_id, name, window, process_cache[group_id])
+            except AtlasAPIError as e:
+                results.append(error_result(group_id, name, e))
 
-        iops_values = sorted({
-            spec.get("regionConfigs", [{}])[0].get("electableSpecs", {}).get("diskIOPS")
-            for spec in specs
-        } - {None})
-        # Can't reliably join a specific shard's replicaSetName back to its specific
-        # replicationSpecs entry (see group_processes_by_replica_set docstring), so if shards
-        # have DIFFERENT provisioned IOPS, don't guess — skip that one threshold check for every
-        # group rather than risk comparing a shard's IOPS usage against the wrong shard's ceiling.
-        iops_note = None
-        if len(iops_values) == 1:
-            provisioned_iops = iops_values[0]
-        elif len(iops_values) > 1:
-            provisioned_iops = None
-            iops_note = (
-                f"IOPS-provisioned threshold skipped: shards have differing provisioned IOPS "
-                f"({', '.join(str(v) for v in iops_values)}) and this script can't confirm which "
-                f"shard each replica set maps to — check disk IOPS headroom per-shard in the Atlas UI."
-            )
-        else:
-            provisioned_iops = None
-
-        procs = list_processes_for_cluster(session, args.group_id, name)
-        shard_groups, routers = group_processes_by_replica_set(procs)
-
-        if len(shard_groups) <= 1 and not routers:
-            # Plain replica set (or nothing matched at all) — unchanged, single-result behavior.
-            group_procs = next(iter(shard_groups.values()), [])
-            cfg["_provisioned_iops"] = provisioned_iops
-            cfg["_max_connections"] = max_connections
-            verdict, reasons, confidence, summary = evaluate_process_group(
-                session, args.group_id, group_procs, cfg, period, granularity, window_days
-            )
-            if iops_note:
-                reasons = reasons + [iops_note]
-            results.append({
-                "cluster": name, "current_tier": tier_display, "verdict": verdict,
-                "reasons": reasons, "confidence": confidence, "metric_summary": summary,
-            })
-        else:
-            # Sharded topology detected (more than one replica set matched, and/or routers present)
-            # — evaluate each shard (and the config-server replica set, which will show up as just
-            # another group) independently, per SKILL.md's documented per-shard behavior.
-            for rs_name in sorted(shard_groups):
-                shard_cfg = dict(cfg)
-                shard_cfg["_provisioned_iops"] = provisioned_iops
-                shard_cfg["_max_connections"] = max_connections
-                verdict, reasons, confidence, summary = evaluate_process_group(
-                    session, args.group_id, shard_groups[rs_name], shard_cfg, period, granularity, window_days
-                )
-                if iops_note:
-                    reasons = reasons + [iops_note]
-                results.append({
-                    "cluster": f"{name} — shard {rs_name}", "current_tier": tier_display,
-                    "verdict": verdict, "reasons": reasons, "confidence": confidence,
-                    "metric_summary": summary,
-                })
-            if routers:
-                router_summary = evaluate_router_group(session, args.group_id, routers, period, granularity)
-                results.append({
-                    "cluster": f"{name} — mongos routers ({len(routers)})", "current_tier": tier_display,
-                    "verdict": "not_applicable",
-                    "reasons": ["mongos routers have no local storage or WiredTiger cache — shown "
-                                "for visibility only, not evaluated against rightsizing thresholds"],
-                    "confidence": "n/a", "metric_summary": router_summary,
-                })
-
-    report_md = build_report(args.group_id, results, window_label)
+    os.makedirs(args.out_dir, exist_ok=True)
+    report_md = build_report(results, window)
     with open(os.path.join(args.out_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write(report_md)
     with open(os.path.join(args.out_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump({
-            "groupId": args.group_id, "windowDays": window_days, "windowLabel": window_label,
+            "generatedAt": utc_now(),
+            "groupIds": sorted({g for g, _ in targets}),
+            "windowDays": window["days"], "windowLabel": window["label"], "granularity": window["granularity"],
             "results": results,
         }, f, indent=2)
 
     print(report_md)
     print(f"\n[written to {args.out_dir}/report.md and report.json]")
+    if any(r["verdict"] == "error" for r in results):
+        print("One or more clusters could not be evaluated because of Atlas API errors (see report).", file=sys.stderr)
+        return 2
+    return 0
+
+
+def error_result(group_id, name, err):
+    return {
+        "group_id": group_id, "cluster_name": name, "cluster": name, "current_tier": "UNKNOWN",
+        "verdict": "error", "confidence": "n/a", "triggers": [], "borderline": [], "notes": [],
+        "reasons": [f"Could not evaluate: {err}"], "coverage": None, "nodes": [],
+    }
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
