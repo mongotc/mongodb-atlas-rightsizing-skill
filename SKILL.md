@@ -14,6 +14,7 @@ than guesswork.
 The user needs Atlas API credentials with at least **Project Read Only** access, set as
 **environment variables** (the script does not accept secrets as flags, so they never land in shell
 history or the process list):
+
 - An Atlas **Service Account**: `ATLAS_CLIENT_ID` / `ATLAS_CLIENT_SECRET` (OAuth2), preferred, or
 - A legacy **API key**: `ATLAS_PUBLIC_KEY` / `ATLAS_PRIVATE_KEY` (HTTP Digest)
 
@@ -55,7 +56,7 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
    - Fetches host and per-disk-partition measurements for **each node** (`granularity=PT1H`,
      `period=P{days}D`), for the metric set in `references/metrics.md`. API failures and rate limits
      are retried, then reported; they are never silently treated as "no data".
-   - Evaluates **each node separately** against `references/thresholds.md` and judges the replica
+   - Evaluates **each node separately** against `references/mongod-thresholds.md` and judges the replica
      set (or shard) by its worst node, so a hot primary isn't averaged away by idle secondaries.
    - Classifies the result as **scale up**, **change disk / IOPS only**, **scale down candidate**,
      **no change**, or **insufficient data**, with a confidence level that accounts for window
@@ -114,16 +115,16 @@ hand-tuning `merge_verdict.py`.
 - `scripts/merge_verdict.py`: combines the two reports. Standard library only.
 - `scripts/config.example.json`: targets file for `rightsizing.py --config` (several projects/clusters).
 - `references/metrics.md`: the Atlas measurement names pulled and why each matters.
-- `references/thresholds.md`: the decision rules and the tier reference table.
+- `references/mongod-thresholds.md`: mongod cluster decision rules and the tier reference table.
 - `references/db-diagnostics.md`: how the two data sources are combined, including disagreements.
 - `tests/`: unit tests (`python -m unittest discover tests`).
 
-Read `references/thresholds.md` before hand-tuning thresholds for a user's risk tolerance (e.g. a
+Read `references/mongod-thresholds.md` before hand-tuning thresholds for a user's risk tolerance (e.g. a
 user who says "we never want to be CPU-bound" wants a lower scale-up trigger than the default).
 
 ## Handling common follow-ups
 
-- **"Why is it recommending X?"**: read back the relevant rule from `references/thresholds.md` and
+- **"Why is it recommending X?"**: read back the relevant rule from `references/mongod-thresholds.md` and
   the node's actual numbers from `report.json` (`nodes[].metric_summary`). Don't just restate the
   recommendation.
 - **"What would the new tier cost?"**: the script doesn't fetch pricing (Atlas has no stable public

@@ -3,7 +3,7 @@
 MongoDB Atlas rightsizing report.
 
 Pulls hardware measurements for one or more clusters from the Atlas Admin API, evaluates every
-node against the rules in ../references/thresholds.md, and writes report.md (human-readable) and
+node against the rules in ../references/mongod-thresholds.md, and writes report.md (human-readable) and
 report.json (structured; consumed by merge_verdict.py).
 
 Auth comes from environment variables only, so secrets never end up in shell history or `ps`:
@@ -51,7 +51,7 @@ HOST_METRICS = [
     "SYSTEM_MEMORY_USED",
     "SYSTEM_MEMORY_FREE",
     "CONNECTIONS",
-    "TICKETS_AVAILABLE_READS",            # context only; see thresholds.md "Concurrency queuing"
+    "TICKETS_AVAILABLE_READS",            # context only; see mongod-thresholds.md "Concurrency queuing"
     "TICKETS_AVAILABLE_WRITE",            # singular "WRITE" is the real Atlas name
     "GLOBAL_LOCK_CURRENT_QUEUE_READERS",
     "GLOBAL_LOCK_CURRENT_QUEUE_WRITERS",
@@ -86,7 +86,7 @@ CORE_HOST_METRICS = (
 )
 CORE_DISK_METRIC = "DISK_PARTITION_SPACE_PERCENT_USED"
 
-# Scale-up triggers and scale-down ceilings. Keep in sync with references/thresholds.md.
+# Scale-up triggers and scale-down ceilings. Keep in sync with references/mongod-thresholds.md.
 CPU_UP, CPU_DOWN = 80, 20                        # % (user + kernel)
 MEM_FREE_UP, MEM_FREE_DOWN = 10, 40              # % free, judged on p5 (low end of the window)
 IOPS_UP, IOPS_DOWN = 0.90, 0.50                  # fraction of provisioned IOPS (read + write)
@@ -246,19 +246,43 @@ def _series(data):
     return out
 
 
+_INVALID_METRIC_RE = re.compile(r'"parameters"\s*:\s*\[\s*"([^"]+)"')
+
+
+def _fetch_measurements(client, measurements_path, query, metric_names):
+    """Fetch a measurements endpoint, dropping metrics Atlas rejects as
+    INVALID_METRIC_NAME and retrying. Needed because a process's supported
+    metric set depends on its role (mongos routers, for example, don't
+    expose WiredTiger cache or global-lock metrics) and Atlas returns 404
+    on the first unknown name rather than ignoring it."""
+    remaining = list(metric_names)
+    while remaining:
+        try:
+            return _series(client.get(measurements_path, query + [("m", m) for m in remaining]))
+        except AtlasAPIError as e:
+            msg = str(e)
+            if "INVALID_METRIC_NAME" not in msg:
+                raise
+            match = _INVALID_METRIC_RE.search(msg)
+            if not match or match.group(1) not in remaining:
+                raise
+            remaining.remove(match.group(1))
+    return {}
+
+
 def fetch_node_metrics(client, group_id, process_id, window, host_only=False):
     """{"host": {metric: series}, "disks": {partition: {metric: series}}} for one process."""
     base = f"/groups/{group_id}/processes/{process_id}"
     query = [("granularity", window["granularity"]), ("period", window["period"])]
-    host = _series(client.get(f"{base}/measurements", query + [("m", m) for m in HOST_METRICS]))
+    host = _fetch_measurements(client, f"{base}/measurements", query, HOST_METRICS)
     disks = {}
     if not host_only:
         for partition in client.get_all(f"{base}/disks"):
             name = partition.get("partitionName")
             if name:
-                disks[name] = _series(client.get(
-                    f"{base}/disks/{name}/measurements", query + [("m", m) for m in DISK_METRICS]
-                ))
+                disks[name] = _fetch_measurements(
+                    client, f"{base}/disks/{name}/measurements", query, DISK_METRICS
+                )
     return {"host": host, "disks": disks}
 
 
@@ -332,22 +356,29 @@ def normalize_tier(tier):
 
 
 def tier_info(cluster_cfg):
-    """Tier(s), provisioned IOPS and auto-scaling settings across every region config."""
+    """Tier(s), provisioned IOPS and auto-scaling settings across every region config.
+
+    Dedicated replica sets nest instanceSize / diskIOPS under electableSpecs.
+    Sharded clusters (v2 API) put them directly on the regionConfig. Check both."""
     tiers, iops, notes = set(), set(), []
     autoscaling = {"compute": None, "disk": False}
     for spec in cluster_cfg.get("replicationSpecs", []):
         for rc in spec.get("regionConfigs", []):
             electable = rc.get("electableSpecs") or {}
-            if electable.get("instanceSize"):
-                tiers.add(electable["instanceSize"])
-            if electable.get("diskIOPS") is not None:
-                iops.add(electable["diskIOPS"])
+            instance_size = electable.get("instanceSize") or rc.get("instanceSize")
+            if instance_size:
+                tiers.add(instance_size)
+            disk_iops = electable.get("diskIOPS")
+            if disk_iops is None:
+                disk_iops = rc.get("diskIOPS")
+            if disk_iops is not None:
+                iops.add(disk_iops)
             for kind in ("readOnlySpecs", "analyticsSpecs"):
                 other = rc.get(kind) or {}
-                if other.get("nodeCount") and other.get("instanceSize") not in (None, electable.get("instanceSize")):
+                if other.get("nodeCount") and other.get("instanceSize") not in (None, instance_size):
                     notes.append(
                         f"{kind[:-5]} nodes run {other['instanceSize']} (electable nodes run "
-                        f"{electable.get('instanceSize')}); they are evaluated against the same thresholds."
+                        f"{instance_size}); they are evaluated against the same thresholds."
                     )
             scaling = rc.get("autoScaling") or {}
             compute = scaling.get("compute") or {}
@@ -767,7 +798,7 @@ def build_report(results, window):
             lines.append("")
     lines.append("---")
     lines.append("This is a read-only recommendation. No cluster was modified. Node roles are as of report time.")
-    lines.append("Verify thresholds against your own risk tolerance before acting (references/thresholds.md).")
+    lines.append("Verify thresholds against your own risk tolerance before acting (references/mongod-thresholds.md).")
     return "\n".join(lines)
 
 

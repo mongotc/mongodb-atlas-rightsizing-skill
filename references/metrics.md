@@ -24,12 +24,12 @@ call covers the whole list. `--hours` runs use `granularity=PT1M` up to 36 hours
 | `SYSTEM_NORMALIZED_CPU_USER` / `SYSTEM_NORMALIZED_CPU_KERNEL` | CPU normalized to the tier's cores, so it's comparable across tiers. Summed per timestamp for the CPU trigger (user + kernel). Both are **core** metrics: if either is missing, the verdict is `insufficient_data`. |
 | `SYSTEM_MEMORY_USED` / `SYSTEM_MEMORY_FREE` | Free share of memory, `free / (free + used)` per sample, judged on its low end (p5). A weaker signal than it looks (Linux uses spare RAM for page cache); see `EXTRA_INFO_PAGE_FAULTS`. Core metrics. |
 | `CONNECTIONS` | Compared against the tier's per-node limit (`TIER_MAX_CONNECTIONS`). |
-| `TICKETS_AVAILABLE_READS` / `TICKETS_AVAILABLE_WRITE` | WiredTiger concurrency tickets, **context only** (see `thresholds.md` "Concurrency queuing"). Atlas naming quirk: `READS` plural, `WRITE` singular. |
+| `TICKETS_AVAILABLE_READS` / `TICKETS_AVAILABLE_WRITE` | WiredTiger concurrency tickets, **context only** (see `mongod-thresholds.md` "Concurrency queuing"). Atlas naming quirk: `READS` plural, `WRITE` singular. |
 | `GLOBAL_LOCK_CURRENT_QUEUE_READERS` / `WRITERS` | The concurrency trigger: operations actually waiting for a slot. |
 | `OP_EXECUTION_TIME_READS` / `WRITES` | Context only; quoted next to a queuing trigger. |
 | `EXTRA_INFO_PAGE_FAULTS` | Per second. A more direct sign of an undersized WT cache than free memory. |
 | `CACHE_BYTES_READ_INTO` | Bytes/sec, context only; quoted next to a page-fault trigger. |
-| `CACHE_FILL_RATIO` / `DIRTY_FILL_RATIO` | WT eviction pressure, already 0–100 (`units: PERCENT`). See `thresholds.md` "WiredTiger eviction thresholds". |
+| `CACHE_FILL_RATIO` / `DIRTY_FILL_RATIO` | WT eviction pressure, already 0–100 (`units: PERCENT`). See `mongod-thresholds.md` "WiredTiger eviction thresholds". |
 | `SYSTEM_NORMALIZED_CPU_IOWAIT` | Context only; quoted next to a disk-latency trigger when above 5%. |
 
 ## Disk-level metrics (`DISK_METRICS` in `rightsizing.py`), per partition

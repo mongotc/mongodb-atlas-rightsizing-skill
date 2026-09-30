@@ -1,3 +1,8 @@
-requests>=2.20
-# Only needed for scripts/db_diagnostics.py
-pymongo>=4.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+dnspython==2.8.0
+idna==3.20
+pymongo==4.18.2
+PyYAML==6.0.3
+requests==2.34.2
+urllib3==2.8.0

@@ -10,6 +10,14 @@ rules.
 
 ## Quick start
 
+Using `pyenv`
+
+```bash
+pyenv virtualenv 3.14.0 rightsizing
+pyenv activate rightsizing
+```
+
+
 ```bash
 pip install -r requirements.txt
 cp .env.example .env    # fill in ATLAS_CLIENT_ID / ATLAS_CLIENT_SECRET (or API key) and MONGODB_URI
