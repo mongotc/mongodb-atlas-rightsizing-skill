@@ -21,7 +21,7 @@ def autoscaling_notes(autoscaling, verdict, trigger_ids):
 
     Args:
         autoscaling: {"compute": {...} or None, "disk": bool}
-        verdict:     e.g. "scale_up", "scale_down_candidate", ...
+        verdict:     "scale_up" | "scale_down" | "no_change"
         trigger_ids: set of trigger IDs that fired for this cluster
     """
     notes = []
@@ -35,7 +35,7 @@ def autoscaling_notes(autoscaling, verdict, trigger_ids):
                 f"sustained load; if it hasn't, the cluster may already be at its max tier — "
                 f"raising maxInstanceSize is likely the right change, not a manual tier bump."
             )
-        elif verdict == "scale_down_candidate":
+        elif verdict == "scale_down":
             if compute.get("scaleDownEnabled"):
                 notes.append(
                     f"Compute auto-scaling with scale-down is ON ({span}). Atlas should "

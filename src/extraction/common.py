@@ -6,10 +6,9 @@ Contents:
   - AtlasClient / AtlasAPIError    auth (OAuth service account or legacy
                                    digest), retry/backoff on 429/5xx,
                                    pagination, errors raised (not swallowed)
-  - HOST_METRICS / DISK_METRICS    Atlas measurement names collected per node
-  - CORE_HOST_METRICS,
-    CORE_DISK_METRIC               metrics required for any verdict beyond
-                                   "insufficient data"
+  - HOST_METRICS / DISK_METRICS /
+    SEARCH_METRICS                 default metric lists for each measurements
+                                   endpoint, built from constants/
   - SHARED_TIERS                   Atlas tiers that don't expose hardware
                                    measurements (M0/M2/M5/Flex/Serverless)
   - fetch_measurements             metric-tolerant fetch: drops metrics Atlas
@@ -40,7 +39,18 @@ _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from constants.tiers import SHARED_TIERS, normalize_tier  # noqa: E402
+from constants.tiers import SHARED_TIERS, normalize_tier, parse_instance_size  # noqa: E402
+# Metric catalogs are maintained in constants/ as the single source of truth —
+# names + units for every process type. The extractor uses the keys as the
+# default metric lists for its three fetch paths. If Atlas rejects any name
+# in a request, fetch_measurements drops it and retries (INVALID_METRIC_NAME
+# handling below), so unused-per-topology metrics are safe to leave in.
+from constants.atlas_mongo_metrics import (  # noqa: E402
+    HARDWARE_METRICS as _MONGO_HARDWARE,
+    STATUS_METRICS as _MONGO_STATUS,
+    DISK_METRICS as _MONGO_DISK,
+)
+from constants.atlas_search_metrics import HARDWARE_METRICS as _SEARCH_HARDWARE  # noqa: E402
 
 
 ATLAS_BASE = "https://cloud.mongodb.com/api/atlas/v2"
@@ -49,64 +59,24 @@ TOKEN_URL = "https://cloud.mongodb.com/api/oauth/token"
 API_VERSION_HEADER = {"Accept": "application/vnd.atlas.2025-03-12+json"}
 
 
-# Host-level metrics: /groups/{groupId}/processes/{processId}/measurements
-HOST_METRICS = [
-    "SYSTEM_NORMALIZED_CPU_USER",
-    "SYSTEM_NORMALIZED_CPU_KERNEL",
-    "SYSTEM_MEMORY_USED",
-    "SYSTEM_MEMORY_FREE",
-    "CONNECTIONS",
-    "TICKETS_AVAILABLE_READS",
-    "TICKETS_AVAILABLE_WRITE",             # singular "WRITE" is the real Atlas name
-    "GLOBAL_LOCK_CURRENT_QUEUE_READERS",
-    "GLOBAL_LOCK_CURRENT_QUEUE_WRITERS",
-    "OP_EXECUTION_TIME_READS",
-    "OP_EXECUTION_TIME_WRITES",
-    "EXTRA_INFO_PAGE_FAULTS",              # per second
-    "CACHE_BYTES_READ_INTO",               # bytes/sec, context only
-    "CACHE_FILL_RATIO",                    # already 0-100
-    "DIRTY_FILL_RATIO",                    # already 0-100
-    "SYSTEM_NORMALIZED_CPU_IOWAIT",        # context only
-]
+# Default metric lists for the three measurements endpoints. Keys come from
+# constants/ (atlas_mongo_metrics for mongod/disk, atlas_search_metrics for FTS).
+# fetch_node_metrics accepts a host_metrics= override — see extract_shard_data
+# which passes atlas_mongos_metrics.ALL_METRICS for SHARD_MONGOS processes.
+#
+# Endpoint mapping:
+#   HOST_METRICS   -> /groups/{gid}/processes/{procId}/measurements           (m=NAME, repeated)
+#   DISK_METRICS   -> /groups/{gid}/processes/{procId}/disks/{part}/measurements
+#   SEARCH_METRICS -> /groups/{gid}/hosts/{procId}/fts/metrics/measurements   (metrics=NAME, repeated;
+#                                                                             response in hardwareMeasurements[])
+HOST_METRICS = list(_MONGO_HARDWARE) + list(_MONGO_STATUS)
+DISK_METRICS = list(_MONGO_DISK)
+SEARCH_METRICS = list(_SEARCH_HARDWARE)
 
-# Atlas Search (FTS / mongot) metrics: /groups/{groupId}/hosts/{processId}/fts/metrics/measurements
-# NOTE: Different endpoint AND different query parameter than HOST_METRICS
-# (this one uses `metrics=NAME` repeated, not `m=NAME`; response schema uses
-# `hardwareMeasurements` instead of `measurements`). Metrics are returned
-# per-mongod-host — Atlas doesn't expose Search Node processes in /processes.
-SEARCH_METRICS = [
-    "FTS_PROCESS_CPU_USER",
-    "FTS_PROCESS_CPU_KERNEL",
-    "FTS_PROCESS_NORMALIZED_CPU_USER",
-    "FTS_PROCESS_NORMALIZED_CPU_KERNEL",
-    "FTS_PROCESS_RESIDENT_MEMORY",
-    "FTS_PROCESS_VIRTUAL_MEMORY",
-    "FTS_PROCESS_SHARED_MEMORY",
-    "FTS_DISK_USAGE",
-]
-
-# Disk-level metrics: /groups/{groupId}/processes/{processId}/disks/{partitionName}/measurements
-DISK_METRICS = [
-    "DISK_PARTITION_IOPS_READ",
-    "DISK_PARTITION_IOPS_WRITE",
-    "DISK_PARTITION_SPACE_PERCENT_USED",   # disk capacity used, NOT I/O busy time
-    "DISK_PARTITION_SPACE_USED",
-    "DISK_PARTITION_SPACE_FREE",
-    "DISK_PARTITION_LATENCY_READ",         # ms per op
-    "DISK_PARTITION_LATENCY_WRITE",
-    "DISK_PARTITION_THROUGHPUT_READ",      # bytes/sec, context only
-    "DISK_PARTITION_THROUGHPUT_WRITE",
-]
-
-# Without these a node can't be judged "fine": a missing core metric means insufficient data.
-CORE_HOST_METRICS = (
-    "SYSTEM_NORMALIZED_CPU_USER",
-    "SYSTEM_NORMALIZED_CPU_KERNEL",
-    "SYSTEM_MEMORY_USED",
-    "SYSTEM_MEMORY_FREE",
-)
-CORE_DISK_METRIC = "DISK_PARTITION_SPACE_PERCENT_USED"
-
+# CORE_HOST_METRICS / CORE_DISK_METRIC (the "insufficient-data" invariants)
+# live in rightsizing/node_eval.py — they encode verdict business rules, not
+# Atlas's offer surface, and only node_eval reads them.
+#
 # SHARED_TIERS is imported from constants.tiers (single source of truth).
 
 
@@ -259,18 +229,28 @@ def fetch_measurements(client, measurements_path, query, metric_names):
     return {}
 
 
-def fetch_node_metrics(client, group_id, process_id, window, host_only=False):
-    """{"host": {metric: series}, "disks": {partition: {metric: series}}} for one process."""
+def fetch_node_metrics(client, group_id, process_id, window, host_only=False,
+                       host_metrics=None):
+    """{"host": {metric: series}, "disks": {partition: {metric: series}}} for one process.
+
+    host_metrics overrides the default HOST_METRICS list — used for mongos
+    routers (pass atlas_mongos_metrics.ALL_METRICS.keys()) so routers get
+    their full catalog instead of the mongod-biased default (which captures
+    only ~7 of ~97 mongos metrics after Atlas drops the WT-only names)."""
     base = f"/groups/{group_id}/processes/{process_id}"
     query = [("granularity", window["granularity"]), ("period", window["period"])]
-    host = fetch_measurements(client, f"{base}/measurements", query, HOST_METRICS)
+    host = fetch_measurements(client=client, measurements_path=f"{base}/measurements",
+                              query=query,
+                              metric_names=list(host_metrics) if host_metrics is not None else HOST_METRICS)
     disks = {}
     if not host_only:
         for partition in client.get_all(f"{base}/disks"):
             name = partition.get("partitionName")
             if name:
                 disks[name] = fetch_measurements(
-                    client, f"{base}/disks/{name}/measurements", query, DISK_METRICS
+                    client=client,
+                    measurements_path=f"{base}/disks/{name}/measurements",
+                    query=query, metric_names=DISK_METRICS,
                 )
     return {"host": host, "disks": disks}
 
@@ -322,7 +302,8 @@ def fetch_search_metrics_for_node(client, group_id, process_id, window):
     """FTS metrics for one mongod host, keyed the same way as the mongod
     node's `host` dict — so callers can shove it under
     `node['data']['fts']` and treat it symmetrically with `data['host']`."""
-    return fetch_fts_measurements(client, group_id, process_id, window)
+    return fetch_fts_measurements(client=client, group_id=group_id,
+                                  process_id=process_id, window=window)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +411,73 @@ def tier_info(cluster_cfg):
     return sorted(tiers) or ["UNKNOWN"], sorted(iops), autoscaling, sorted(set(notes))
 
 
+def _summarize_regions(cluster_cfg):
+    """One row per regionConfig with the four axes Atlas encodes in
+    `instanceSize` (base tier, class, storage class, generation) plus the
+    cloud provider and region. Prefers `effectiveElectableSpecs` so autoscale
+    drift is reflected; falls back to `electableSpecs` (requested) and then
+    the regionConfig-level `instanceSize` for sharded (v2 API) shapes.
+    See Atlas Admin API HardwareSpec20240805 enum (checked 2026-10-06)."""
+    rows = []
+    for spec in (cluster_cfg or {}).get("replicationSpecs", []):
+        for rc in spec.get("regionConfigs", []):
+            effective = rc.get("effectiveElectableSpecs") or {}
+            electable = rc.get("electableSpecs") or {}
+            instance_size = (
+                effective.get("instanceSize")
+                or electable.get("instanceSize")
+                or rc.get("instanceSize")
+            )
+            node_count = (
+                effective.get("nodeCount")
+                or electable.get("nodeCount")
+                or rc.get("nodeCount")
+            )
+            # Per-regionConfig provisioned IOPS. Prefer effectiveElectableSpecs
+            # (reflects autoscale drift) then electableSpecs, then the
+            # regionConfig-level field (sharded shape). None = not reported.
+            disk_iops = (
+                effective.get("diskIOPS")
+                if effective.get("diskIOPS") is not None else
+                electable.get("diskIOPS")
+                if electable.get("diskIOPS") is not None else
+                rc.get("diskIOPS")
+            )
+            # Configured storage. Atlas 2024-05-30+ moved diskSizeGB out of the
+            # top-level cluster field and nested it under electableSpecs; the
+            # top-level field is absent/null on newer-API responses. Prefer
+            # effective → electable → regionConfig to match the IOPS lookup.
+            disk_size_gb = (
+                effective.get("diskSizeGB")
+                if effective.get("diskSizeGB") is not None else
+                electable.get("diskSizeGB")
+                if electable.get("diskSizeGB") is not None else
+                rc.get("diskSizeGB")
+            )
+            # EBS volume type (AWS only; GCP/Azure return None).
+            ebs_volume_type = (
+                effective.get("ebsVolumeType")
+                or electable.get("ebsVolumeType")
+                or rc.get("ebsVolumeType")
+            )
+            base, cls, storage, gen = parse_instance_size(instance_size)
+            rows.append({
+                "provider": rc.get("providerName"),
+                "backing_provider": rc.get("backingProviderName"),
+                "region": rc.get("regionName"),
+                "instance_size": instance_size,
+                "base_tier": base,
+                "class": cls,
+                "storage": storage,
+                "generation": gen,
+                "node_count": node_count,
+                "disk_iops": disk_iops,
+                "disk_size_gb": disk_size_gb,
+                "ebs_volume_type": ebs_volume_type,
+            })
+    return rows
+
+
 def summarize_config(cluster_cfg):
     """Extract the small subset of cluster config the rightsizing evaluator
     needs. Persisted as the top-level `config` block on every extraction.json
@@ -438,18 +486,50 @@ def summarize_config(cluster_cfg):
     Returns:
       {
         "cluster_type": "REPLICASET" | "SHARDED" | "GEOSHARDED" | None,
-        "tiers": ["M10", ...],           # tier_info()[0]
+        "tiers": ["M10", ...],           # tier_info()[0]; raw instance_size strings
         "provisioned_iops": [3000, ...], # tier_info()[1]; empty when Atlas
                                          # doesn't report diskIOPS
+        "disk_size_gb": 200,             # cluster-wide configured storage
+                                         # (Atlas cluster.diskSizeGB)
         "autoscaling": {"compute": {...}|None, "disk": bool},
         "tier_notes": ["analytics nodes run M20 ...", ...],
+        "regions": [                     # per-regionConfig breakdown with the
+          {                              # four axes Atlas encodes in instanceSize
+            "provider": "GCP",           # (base_tier, class, storage, generation)
+            "backing_provider": None,
+            "region": "CENTRAL_US",
+            "instance_size": "M40_GEN_2",
+            "base_tier": "M40",
+            "class": "general",          # 'general' | 'low_cpu'
+            "storage": "standard",       # 'standard' | 'nvme'
+            "generation": "gen2",        # 'gen1' | 'gen2'
+            "node_count": 3,
+            "disk_iops": 3000,           # per-regionConfig provisioned IOPS
+                                         # (None when Atlas doesn't report)
+            "ebs_volume_type": "PROVISIONED",  # AWS only; None otherwise
+          },
+          ...
+        ],
       }
     """
     tiers, iops, autoscaling, notes = tier_info(cluster_cfg or {})
+    regions = _summarize_regions(cluster_cfg)
+    # Fall back to the first non-null per-region disk_size_gb when Atlas
+    # doesn't populate the deprecated top-level cluster.diskSizeGB (true for
+    # 2024-05-30+ API responses). Keeps the top-level field useful for a
+    # quick "cluster storage" readout at the config level.
+    top_level_size = (cluster_cfg or {}).get("diskSizeGB")
+    if top_level_size is None:
+        for r in regions:
+            if r.get("disk_size_gb") is not None:
+                top_level_size = r["disk_size_gb"]
+                break
     return {
         "cluster_type": (cluster_cfg or {}).get("clusterType"),
         "tiers": tiers,
         "provisioned_iops": iops,
+        "disk_size_gb": top_level_size,
         "autoscaling": autoscaling,
         "tier_notes": notes,
+        "regions": regions,
     }

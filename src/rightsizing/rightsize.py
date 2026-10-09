@@ -13,7 +13,7 @@ Example:
 
   python src/rightsizing/rightsize.py \\
     --extraction path/to/extraction.json \\
-    --thresholds path/to/custom-thresholds.yaml \\
+    --thresholds path/to/custom-config.yaml \\
     --out /tmp/out
 """
 
@@ -57,14 +57,14 @@ def _default_out_dir(extraction_path):
     return os.path.dirname(os.path.abspath(extraction_path)) or "."
 
 
-def main(argv=None):
+def console_main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--extraction", required=True,
                     help="Path to extraction.json (from src/extraction/)")
     ap.add_argument("--thresholds", default=None,
-                    help=f"Path to thresholds.yaml (default: {DEFAULT_YAML_PATH})")
+                    help=f"Path to config.yaml (default: {DEFAULT_YAML_PATH})")
     ap.add_argument("--out", default=None,
                     help="Output directory (default: same directory as --extraction). "
                          "'-' writes rightsizing.json to stdout and skips the markdown.")
@@ -79,12 +79,12 @@ def main(argv=None):
         sys.exit(f"Invalid JSON in extraction: {e}")
 
     try:
-        thresholds = load_thresholds(args.thresholds)
+        thresholds = load_thresholds(path=args.thresholds)
     except (OSError, KeyError, ValueError) as e:
         sys.exit(f"Could not load thresholds: {e}")
 
-    window = _window_from_extraction(extraction)
-    results = evaluate_mod.evaluate(extraction, thresholds, window)
+    window = _window_from_extraction(extraction=extraction)
+    results = evaluate_mod.evaluate(extraction=extraction, thresholds=thresholds, window=window)
 
     extras = {
         "cluster": extraction.get("cluster"),
@@ -95,18 +95,20 @@ def main(argv=None):
 
     if args.out == "-":
         print(json.dumps(build_report_json(
-            results, window, thresholds_source=thresholds.source_path, extras=extras),
+            results=results, window=window,
+            thresholds_source=thresholds.source_path, extras=extras),
             indent=2, default=str))
     else:
-        out_dir = args.out or _default_out_dir(args.extraction)
+        out_dir = args.out or _default_out_dir(extraction_path=args.extraction)
         md_path, json_path = write_report(
-            results, window, out_dir,
+            results=results, window=window, out_dir=out_dir,
             thresholds_source=thresholds.source_path, extras=extras)
-        print(build_report_md(results, window, thresholds.source_path))
+        print(build_report_md(results=results, window=window,
+                              thresholds_source=thresholds.source_path))
         print(f"\n[written to {md_path} and {json_path}]", file=sys.stderr)
 
     return 2 if any(r.get("verdict") == "error" for r in results) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(console_main())

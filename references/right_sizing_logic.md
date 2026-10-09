@@ -1,18 +1,79 @@
 # Rightsizing decision rules
 
-These are defaults tuned for "don't cry wolf, but don't miss a real problem." Adjust per user risk
-tolerance: a user optimizing hard for cost will want lower scale-down bars; a user who says latency
-or incidents matter most wants lower scale-up bars and more headroom than these defaults leave.
+Rightsizing is the process of evulating a cluster deployment and it's current
+usage, and then determine if cluster should be adjusted based its current . Here are the list of recommendation
+that we should get depending on the deployment:
 
-The constants live at the top of `scripts/rightsizing.py`; keep them and this page in sync.
+1. replicaset: scale up
+2. replicaset: scale down
+3. replicaset: no change
+4. shard: add shard
+5. shard: reduce shard
+6. shard: scale up
+7. shard: scale down
+8. shard: no change
+9. search node: switch to shared search (in case no index exists) 
+10. search node: add node
+11. search node: remove node
+12. search node: scale up
+13. search node: scale down
+14. search node: no change
 
-## How a cluster is evaluated
 
-- **Every node is evaluated on its own**, then the replica set (or shard) is judged by its worst
-  node. Pooling primary and secondary samples would let two idle secondaries hide a primary pinned
+# How is a cluster is evaluated
+
+- Metric are fetch from Atlas API, using rest endpoints and stored to files
+- The period and granularity is set in the `config.yaml` file - this can be fine tuned
+- A node is a host that is running mongod
+- A node could also be running mongos (router) if it's a sharded cluster 
+- A node could also be running mongot (search) if it's hosting shared search
+- A node has large number of metrics which can grouped into two categories: compute and disk 
+- every node is evaluated and is flagged if it's under-provisioned or over-provisioned.
+- if cluster is a replica set (or shard) is judged by its worst node - 
+  Pooling primary and secondary samples would let two idle secondaries hide a primary pinned
   at 90% CPU.
-- Each disk partition is evaluated on its own too.
+- Each node disk partition is evaluated on its own too.
 - Percentiles are taken over the node's own samples for the whole window.
+
+## Node Evaluation 
+
+* breached day: a day is flagged as "breached" when that day's p95 is over the threshold.
+  For example if CPU usage P95 is below 20% 
+
+* sustained: means "breached day" is 40% of extraction days. So for example
+  if we have 3 breached days in the last 7 days, thats flagged as sustained.
+  So if CPU 
+  days, minimum 1. A p95 over the threshold that isn't sustained is reported as "close to a trigger",
+not as a trigger.
+
+**breached threshold** is a min duration which the value is within the 
+threshold
+
+**Disk-only verdict:** if every trigger that fired is a disk signal (IOPS, disk space, disk
+latency), the verdict is **change disk / IOPS only**: check whether more IOPS or a bigger disk
+resolves it before recommending a compute tier jump. Dedicated tiers support independently
+provisioned IOPS on most cloud providers.
+
+Adjust per user risk tolerance: a user optimizing hard for cost will want lower 
+scale-down bars; a user who says latency or incidents matter most wants lower 
+scale-up bars and more headroom than these defaults leave.
+
+We are basically flagging a node as under-utilized or over-utilized:
+
+| Type | What | Window |	Lookback |	Metric to read|
+| -----|------|--------|-----------|----------------|
+| Over-utilized |	Moments where the resource ran out | Fine: 1 min, or 10 to 60 sec if available | Days | p99 and max
+| Under-utilized |	Sustained headroom you’re paying for |	Coarse: 5 min to 1 hour is fine | 2 to 4 weeks (catch weekly and month-end cycles) | p95, compared to capacity
+
+normal sits between this
+
+| Metric | Under-utilized | Normal (right-sized) | Over-utilized |
+| --- | --- | --- | --- |
+| **CPU p95** (over weeks) | below ~30% | ~40 to 70% | above ~75 to 80% |
+| **CPU p99 / max** (1-min or finer) | well below 60% | below ~85%, brief spikes OK | regularly 90 to 100% |
+| **IOPS p95** (% of provisioned) | below ~30% | ~40 to 70% | above ~75 to 80% |
+| **IOPS p99** (10 sec to 1 min) | well below 60% | below ~80% | touching the limit |
+| **Saturation signals** (run queue, disk queue, I/O latency) | flat | flat, small bumps during peaks | climbing with the peaks |
 
 ## Scale UP triggers (any one is enough; every one that fired is listed)
 
@@ -29,15 +90,7 @@ The constants live at the top of `scripts/rightsizing.py`; keep them and this pa
 | Cache fill ratio | p95 > 80% (WT `eviction_target`) | no |
 | Dirty fill ratio | p95 > 5% (WT `eviction_dirty_target`) | no |
 
-**Sustained** means the threshold is also breached on at least 3 of the last 7 UTC days (a day
-counts when that day's own p95 is over the threshold). Shorter windows need proportionally fewer
-days, minimum 1. A p95 over the threshold that isn't sustained is reported as "close to a trigger",
-not as a trigger.
 
-**Disk-only verdict:** if every trigger that fired is a disk signal (IOPS, disk space, disk
-latency), the verdict is **change disk / IOPS only**: check whether more IOPS or a bigger disk
-resolves it before recommending a compute tier jump. Dedicated tiers support independently
-provisioned IOPS on most cloud providers.
 
 If several signals fire together (e.g. CPU + IOPS), say so explicitly: it changes the fix (compute
 bump vs. IOPS bump vs. both).

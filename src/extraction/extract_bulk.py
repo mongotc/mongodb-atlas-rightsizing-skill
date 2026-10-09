@@ -11,8 +11,9 @@ cluster it lists, this script:
   - Records a per-cluster status entry
   - Continues on per-cluster errors — one bad cluster does not stop the batch
 
-Uses the same window semantics as extract.py (--days / --hours) and the same
-project-root-anchored OUTPUT_DIR convention.
+Uses the same window semantics as extract.py — lookback is configured in
+src/config.yaml under `extraction:` — and the same project-root-anchored
+OUTPUT_DIR convention.
 
 Default output layout:
   <project root>/<OUTPUT_DIR>/<org>/<project>/<cluster>/extraction.json
@@ -25,7 +26,7 @@ Auth (env only): same as extract.py / gather_info.py
 
 Example:
   python src/extraction/extract_bulk.py \\
-    --inventory output/<org>/inventory.json --days 7
+    --inventory output/<org>/inventory.json
 """
 
 import argparse
@@ -43,9 +44,6 @@ from extract_search_data import extract as extract_search
 # Project root = 3 levels up from src/extraction/extract_bulk.py.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _OUTPUT_DIR_NAME = os.environ.get("OUTPUT_DIR", "output")
-
-DEFAULT_DAYS = 7
-DEFAULT_HOURS = None
 
 
 def _utc_now():
@@ -91,7 +89,8 @@ def _extract_one(client, project, cluster, processes, window, base_out_dir):
         return entry
 
     try:
-        result = extract_cluster(client, pid, cfg, window, processes)
+        result = extract_cluster(client=client, group_id=pid, cluster_cfg=cfg,
+                                 window=window, processes=processes)
     except AtlasAPIError as e:
         entry.update(status="error", error=f"extraction: {e}")
         return entry
@@ -101,13 +100,14 @@ def _extract_one(client, project, cluster, processes, window, base_out_dir):
     # Search Nodes attached). Attach the search extractor's result as a
     # sibling field; failures here don't fail the whole cluster.
     try:
-        result["search"] = extract_search(client, pid, cfg, window, processes)
+        result["search"] = extract_search(client=client, group_id=pid, cluster_cfg=cfg,
+                                          window=window, processes=processes)
     except AtlasAPIError as e:
         result["search"] = {"type": "search", "cluster": cname, "error": str(e)}
 
     # Stamp identity onto the result so a stray file is self-describing.
     result.update({"cluster": cname, "project_id": pid, "project_name": pname})
-    out_path = os.path.join(base_out_dir, _slugify(pname), cname, "extraction.json")
+    out_path = os.path.join(base_out_dir, _slugify(name=pname), cname, "extraction.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, default=str)
@@ -122,24 +122,20 @@ def main(argv=None):
     )
     ap.add_argument("--inventory", required=True,
                     help="Path to inventory.json (from src/discovery/gather_info.py)")
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
-                    help="Lookback window in days (default: %(default)s)")
-    ap.add_argument("--hours", type=int, default=DEFAULT_HOURS,
-                    help="Lookback in hours; overrides --days (default: %(default)s)")
     ap.add_argument("--out-dir", default=None,
                     help="Base output directory. Default: "
                          "<project root>/<OUTPUT_DIR>/<org_slug>/")
     args = ap.parse_args(argv)
 
     try:
-        inventory = _load_inventory(args.inventory)
+        inventory = _load_inventory(path=args.inventory)
     except OSError as e:
         sys.exit(f"Could not read inventory: {e}")
     except json.JSONDecodeError as e:
         sys.exit(f"Invalid JSON in inventory: {e}")
 
     try:
-        window = _build_window(args.days, args.hours)
+        window = _build_window()
     except ValueError as e:
         ap.error(str(e))
 
@@ -148,7 +144,7 @@ def main(argv=None):
     except AtlasAPIError as e:
         sys.exit(str(e))
 
-    base_out_dir = args.out_dir or _default_out_dir(inventory)
+    base_out_dir = args.out_dir or _default_out_dir(inventory=inventory)
     os.makedirs(base_out_dir, exist_ok=True)
 
     print(f"Extracting from {args.inventory}")
@@ -160,7 +156,7 @@ def main(argv=None):
     # per cluster.
     process_cache = {}
     results = []
-    for project, cluster in _iter_clusters(inventory):
+    for project, cluster in _iter_clusters(inventory=inventory):
         pid = project["id"]
         pname = project.get("name") or pid
         cname = cluster["name"]
@@ -181,7 +177,9 @@ def main(argv=None):
             continue
 
         print(f"[run]  {pname} / {cname}")
-        entry = _extract_one(client, project, cluster, processes, window, base_out_dir)
+        entry = _extract_one(client=client, project=project, cluster=cluster,
+                             processes=processes, window=window,
+                             base_out_dir=base_out_dir)
         results.append(entry)
         if entry["status"] == "ok":
             print(f"[ok]   {pname} / {cname}: {entry.get('type')} -> {entry['out']}")
@@ -192,7 +190,8 @@ def main(argv=None):
         "generated_at": _utc_now(),
         "org": inventory.get("org"),
         "inventory": os.path.abspath(args.inventory),
-        "window": {"days": args.days, "hours": args.hours, "label": window["label"]},
+        "window": {"days": window.get("days"), "label": window["label"],
+                   "period": window["period"], "granularity": window["granularity"]},
         "count": len(results),
         "errors": sum(1 for r in results if r.get("status") == "error"),
         "results": results,

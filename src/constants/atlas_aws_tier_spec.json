@@ -1,0 +1,13 @@
+{
+    "schema_version": "1.0",
+    "product": "MongoDB Atlas Core - AWS Cloud - Clusters",
+    "generated_on": "2026-10-06",
+    "cloud_provider": "aws",
+    "references": [
+        {
+            "desc": "the AWS instance size name - TODO incomplete",
+            "variable_name": "AWSHardwareSpec20240805.instanceSize"
+        }
+    ],
+    "tiers": []
+}

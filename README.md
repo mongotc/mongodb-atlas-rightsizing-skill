@@ -55,3 +55,34 @@ python -m unittest discover tests
 ## Requirements
 
 Python 3.8+. `requests` for `rightsizing.py`; `pymongo` only for `db_diagnostics.py`.
+
+
+# New Version
+
+
+```bash
+set -a; . ./.env; set +a 
+
+# get inventory
+python src/discovery/gather_info.py
+
+
+# download metrics for all item in inventory
+python src/extraction/extract_bulk.py \
+--inventory "output/persona/inventory.json" 
+
+# download metrics for a specific inventory
+python src/extraction/extract.py \
+--group-id  "65a974002c733009f81a6a3e" \
+--cluster "buildkite-runner" \
+--out "output/persona/persona-ci/buildkite-runner/extraction.json"
+
+# download metrics for all items in the inventory
+python src/rightsizing/rightsize_bulk.py \  
+  --summary output/persona/extraction_summary.json                    
+
+# visualize the metrics for a specific cluster
+python src/visualize/visualize.py \
+  --extraction "output/persona/persona-ci/buildkite-runner/extraction.json"
+
+```

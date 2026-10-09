@@ -45,22 +45,24 @@ def extract(client, group_id, cluster_cfg, window, processes):
           ],
         }
     """
-    host_keys = cluster_host_keys(cluster_cfg)
+    host_keys = cluster_host_keys(cluster_cfg=cluster_cfg)
     cluster_name = cluster_cfg.get("name", "")
-    cluster_procs = [p for p in processes if process_matches(p, host_keys, cluster_name)]
+    cluster_procs = [p for p in processes
+                     if process_matches(proc=p, host_keys=host_keys, cluster_name=cluster_name)]
     return {
         "type": "replica_set",
         "cluster": cluster_name,
-        "config": summarize_config(cluster_cfg),
-        "nodes": [_extract_node(client, group_id, p, window)
+        "config": summarize_config(cluster_cfg=cluster_cfg),
+        "nodes": [_extract_node(client=client, group_id=group_id, proc=p, window=window)
                   for p in cluster_procs if p.get("id")],
     }
 
 
 def _extract_node(client, group_id, proc, window):
     return {
-        "label": node_label(proc),
+        "label": node_label(proc=proc),
         "role": proc.get("typeName"),
-        "hosts": node_hosts(proc),
-        "data": fetch_node_metrics(client, group_id, proc["id"], window, host_only=False),
+        "hosts": node_hosts(proc=proc),
+        "data": fetch_node_metrics(client=client, group_id=group_id,
+                                   process_id=proc["id"], window=window, host_only=False),
     }

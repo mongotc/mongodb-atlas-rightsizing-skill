@@ -27,8 +27,49 @@ TIER_MAX_CONNECTIONS = {
 SHARED_TIERS = {"M0", "M2", "M5", "FLEX", "SERVERLESS"}
 
 
+
 def normalize_tier(tier):
     """'M30_NVME' or 'R40' -> 'M30' / 'M40', so R-series and _NVME variants
     look up the same connection limit as their base M-number."""
     m = re.match(r"^[MR](\d+)", tier or "")
     return f"M{m.group(1)}" if m else None
+
+
+# Mapping rules verified against the Atlas Admin API v2 OpenAPI spec on
+# 2026-10-06 (HardwareSpec enums for AWS/GCP/Azure). Keep in sync with
+# https://www.mongodb.com/docs/api/doc/atlas-admin-api-v2.json when Atlas
+# adds new generations or suffixes.
+_INSTANCE_SIZE_RE = re.compile(r"^(?P<prefix>[MR])(?P<num>\d+)$")
+
+
+def parse_instance_size(size):
+    """Decompose an Atlas instanceSize string into its four axes.
+
+    Returns (base_tier, class, storage, generation). Any failure to parse
+    returns (None, None, None, None).
+
+    Examples:
+      'M40'            -> ('M40', 'general', 'standard', 'gen1')
+      'R30'            -> ('M30', 'low_cpu', 'standard', 'gen1')
+      'M40_NVME'       -> ('M40', 'general', 'nvme',     'gen1')  # AWS only
+      'M40_GEN_2'      -> ('M40', 'general', 'standard', 'gen2')
+      'R40_GEN_2'      -> ('M40', 'low_cpu', 'standard', 'gen2')
+      'M40_NVME_GEN_2' -> ('M40', 'general', 'nvme',     'gen2')  # AWS only
+    """
+    if not size:
+        return (None, None, None, None)
+    s = str(size).upper()
+    generation = "gen1"
+    if s.endswith("_GEN_2"):
+        generation = "gen2"
+        s = s[:-6]
+    storage = "standard"
+    if s.endswith("_NVME"):
+        storage = "nvme"
+        s = s[:-5]
+    m = _INSTANCE_SIZE_RE.match(s)
+    if not m:
+        return (None, None, None, None)
+    tier_class = "general" if m.group("prefix") == "M" else "low_cpu"
+    base_tier = f"M{m.group('num')}"
+    return (base_tier, tier_class, storage, generation)

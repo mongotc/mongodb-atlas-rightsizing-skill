@@ -5,15 +5,14 @@ Consumes the extraction.json produced by src/extraction/ (per-cluster metric
 time-series + a small `config` block with tier / provisioned IOPS /
 autoscaling) and produces a verdict per cluster:
 
-  scale_up            — one or more scale-up thresholds crossed
-  disk_iops_only      — only disk signals fired; fix with more IOPS / disk
-  scale_down_candidate — comfortable under every scale-down bar (conservative)
-  no_change           — no scale-up trigger crossed
-  insufficient_data   — core metrics missing or too new a cluster
-  not_supported       — shared / free / flex / serverless tier
-  not_applicable      — mongos routers (informational only)
+  scale_up    — one or more scale-up thresholds crossed
+  scale_down  — comfortable under every scale-down bar (requires 7+ day window)
+  no_change   — anything else (insufficient data, shared tier, mongos, borderline)
 
-Threshold values live in thresholds.yaml (tunable). Atlas fact tables (tier
+Detail that used to be its own verdict (disk-only triggers, insufficient data,
+free/shared tier, mongos routers) now lives in the `reasons` field.
+
+Threshold values live in src/config.yaml (tunable). Atlas fact tables (tier
 connection limits, shared-tier set) live in src/constants/tiers.py.
 
 Per-cluster-shape evaluators, mirroring src/extraction/:

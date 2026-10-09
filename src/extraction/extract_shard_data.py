@@ -24,6 +24,13 @@ from common import (
     process_matches,
     summarize_config,
 )
+from constants.atlas_mongos_metrics import ALL_METRICS as _MONGOS_METRICS
+
+# Pre-computed list of metric names routers (mongos) actually expose. Passed
+# to fetch_node_metrics for every SHARD_MONGOS process so the extraction
+# captures the full ~97-metric catalog from atlas_mongos_metrics.py instead
+# of the ~7-metric intersection you'd get by reusing the mongod HOST_METRICS.
+MONGOS_HOST_METRICS = list(_MONGOS_METRICS.keys())
 
 
 def extract(client, group_id, cluster_cfg, window, processes):
@@ -53,28 +60,34 @@ def extract(client, group_id, cluster_cfg, window, processes):
       {"label", "role", "hosts", "data": {"host", "disks"}}. Router entries
       have data["disks"] == {} because they don't have local storage.
     """
-    host_keys = cluster_host_keys(cluster_cfg)
+    host_keys = cluster_host_keys(cluster_cfg=cluster_cfg)
     cluster_name = cluster_cfg.get("name", "")
-    cluster_procs = [p for p in processes if process_matches(p, host_keys, cluster_name)]
-    shard_groups, routers = group_processes_by_replica_set(cluster_procs)
+    cluster_procs = [p for p in processes
+                     if process_matches(proc=p, host_keys=host_keys, cluster_name=cluster_name)]
+    shard_groups, routers = group_processes_by_replica_set(procs=cluster_procs)
     return {
         "type": "sharded",
         "cluster": cluster_name,
-        "config": summarize_config(cluster_cfg),
+        "config": summarize_config(cluster_cfg=cluster_cfg),
         "shards": {
-            rs_name: [_extract_node(client, group_id, p, window, host_only=False)
+            rs_name: [_extract_node(client=client, group_id=group_id, proc=p,
+                                    window=window, host_only=False)
                       for p in group if p.get("id")]
             for rs_name, group in sorted(shard_groups.items())
         },
-        "routers": [_extract_node(client, group_id, p, window, host_only=True)
+        "routers": [_extract_node(client=client, group_id=group_id, proc=p,
+                                  window=window, host_only=True,
+                                  host_metrics=MONGOS_HOST_METRICS)
                     for p in routers if p.get("id")],
     }
 
 
-def _extract_node(client, group_id, proc, window, host_only):
+def _extract_node(client, group_id, proc, window, host_only, host_metrics=None):
     return {
-        "label": node_label(proc),
+        "label": node_label(proc=proc),
         "role": proc.get("typeName"),
-        "hosts": node_hosts(proc),
-        "data": fetch_node_metrics(client, group_id, proc["id"], window, host_only=host_only),
+        "hosts": node_hosts(proc=proc),
+        "data": fetch_node_metrics(client=client, group_id=group_id,
+                                   process_id=proc["id"], window=window,
+                                   host_only=host_only, host_metrics=host_metrics),
     }

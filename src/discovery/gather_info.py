@@ -43,6 +43,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from common.atlas_api import AtlasClient, AtlasAPIError, utc_now  # noqa: E402
+from constants.atlas_process_types import MONGOS_TYPES  # noqa: E402
 
 
 # Project root = 3 levels up from src/discovery/gather_info.py. Anchoring here
@@ -51,8 +52,13 @@ from common.atlas_api import AtlasClient, AtlasAPIError, utc_now  # noqa: E402
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _OUTPUT_DIR_NAME = os.environ.get("OUTPUT_DIR", "output")
 
-# Dedicated Search Nodes always listen on this port; confirmed empirically.
-SEARCH_NODE_PORT = 27020
+# Dedicated Search Nodes listen on this port. Confirmed empirically against
+# a live Atlas cluster on 2026-10-08 (older topologies used 27020). Not
+# returned by any API — /search/indexes gives short hostnames only,
+# /search/deployment has no hostnames, mongot does not appear in /processes.
+# If Atlas changes this again, update here and in
+# src/extraction/extract_search_data.py (same constant, duplicated).
+SEARCH_NODE_PORT = 28000
 
 
 def _slugify(name):
@@ -75,6 +81,64 @@ def cluster_tiers(cluster_cfg):
             if size:
                 tiers.add(size)
     return sorted(tiers)
+
+
+def _cluster_regions(cluster_cfg):
+    """Per-regionConfig breakdown with the hardware fields that make the
+    inventory self-describing: provider, region, provisioned instance_size,
+    node_count, per-region disk_iops and (AWS) ebs_volume_type.
+
+    Prefers effectiveElectableSpecs (reflects autoscale drift), then
+    electableSpecs (requested), then the regionConfig-level field (sharded
+    v2 shape). Mirrors extraction.common.summarize_config()['regions'] so
+    inventory consumers see the same shape as extraction.json."""
+    rows = []
+    for spec in (cluster_cfg or {}).get("replicationSpecs", []):
+        for rc in spec.get("regionConfigs", []):
+            effective = rc.get("effectiveElectableSpecs") or {}
+            electable = rc.get("electableSpecs") or {}
+            instance_size = (
+                effective.get("instanceSize")
+                or electable.get("instanceSize")
+                or rc.get("instanceSize")
+            )
+            node_count = (
+                effective.get("nodeCount")
+                or electable.get("nodeCount")
+                or rc.get("nodeCount")
+            )
+            disk_iops = (
+                effective.get("diskIOPS")
+                if effective.get("diskIOPS") is not None else
+                electable.get("diskIOPS")
+                if electable.get("diskIOPS") is not None else
+                rc.get("diskIOPS")
+            )
+            # Atlas 2024-05-30+ nests diskSizeGB under electableSpecs; the
+            # top-level cluster.diskSizeGB is absent on newer-API responses.
+            disk_size_gb = (
+                effective.get("diskSizeGB")
+                if effective.get("diskSizeGB") is not None else
+                electable.get("diskSizeGB")
+                if electable.get("diskSizeGB") is not None else
+                rc.get("diskSizeGB")
+            )
+            ebs_volume_type = (
+                effective.get("ebsVolumeType")
+                or electable.get("ebsVolumeType")
+                or rc.get("ebsVolumeType")
+            )
+            rows.append({
+                "provider": rc.get("providerName"),
+                "backing_provider": rc.get("backingProviderName"),
+                "region": rc.get("regionName"),
+                "instance_size": instance_size,
+                "node_count": node_count,
+                "disk_iops": disk_iops,
+                "disk_size_gb": disk_size_gb,
+                "ebs_volume_type": ebs_volume_type,
+            })
+    return rows
 
 
 def _extract_mongod_hosts(cluster_cfg):
@@ -102,9 +166,54 @@ def _extract_mongod_hosts(cluster_cfg):
     return process_ids, short_names
 
 
-def summarize_cluster(cfg):
+def _extract_mongos_hosts(cluster_cfg, project_processes):
+    """Pull mongos (host:port, short-hostname) parallel lists from the project's
+    /processes response, scoped to the given cluster.
+
+    SHARDED-ONLY: replica-set clusters have no mongos; returns ([], []).
+
+    Matching: connectionStrings.standard lists the mongos endpoints by
+    userAlias for THIS cluster (e.g. 'data-products-config-00-00'). We
+    build the set of expected userAliases from that string and match
+    /processes entries by typeName == SHARD_MONGOS *and* userAlias. Domain
+    alone isn't enough — multiple clusters in a project share a DNS domain
+    (e.g. '.c0xht1.mongodb.net'), so a domain-only filter bundles their
+    mongos together. The returned host:port uses the internal `hostname`
+    field (not userAlias) because that's what the /measurements endpoint
+    expects."""
+    if not cluster_cfg or not project_processes:
+        return [], []
+    client_facing_ids, _ = _extract_mongod_hosts(cluster_cfg)
+    expected_aliases = {pid.split(":", 1)[0] for pid in client_facing_ids}
+    if not expected_aliases:
+        return [], []
+    process_ids, short_names = [], []
+    for p in project_processes:
+        if p.get("typeName") not in MONGOS_TYPES:
+            continue
+        alias = p.get("userAlias") or ""
+        if alias not in expected_aliases:
+            continue
+        hostname = p.get("hostname") or ""
+        port = p.get("port")
+        pid = f"{hostname}:{port}" if port else hostname
+        process_ids.append(pid)
+        short_names.append(hostname.split(".", 1)[0])
+    return process_ids, short_names
+
+
+def summarize_cluster(cfg, project_processes=None):
     tiers = cluster_tiers(cfg)
     process_ids, short_hostnames = _extract_mongod_hosts(cfg)
+    mongos_ids, mongos_short = _extract_mongos_hosts(
+        cluster_cfg=cfg, project_processes=project_processes or [])
+    regions = _cluster_regions(cfg)
+    disk_size_gb = cfg.get("diskSizeGB")
+    if disk_size_gb is None:
+        for r in regions:
+            if r.get("disk_size_gb") is not None:
+                disk_size_gb = r["disk_size_gb"]
+                break
     return {
         "name": cfg.get("name"),
         "cluster_type": cfg.get("clusterType"),
@@ -112,9 +221,13 @@ def summarize_cluster(cfg):
         "state": cfg.get("stateName"),
         "paused": cfg.get("paused"),
         "tier": tiers[0] if len(tiers) == 1 else (tiers or None),
+        "disk_size_gb": disk_size_gb,
+        "regions": regions,
         "create_date": cfg.get("createDate"),
         "mongod_process_ids": process_ids,
         "mongod_hostnames": short_hostnames,
+        "mongos_process_ids": mongos_ids,
+        "mongos_hostnames": mongos_short,
     }
 
 
@@ -251,20 +364,31 @@ def main(argv=None):
                              "error": str(e), "clusters": []})
             print(f"[err]  {pname} ({pid}): {e}", file=sys.stderr)
             continue
+        # One fetch per project — processes carry typeName (SHARD_MONGOS,
+        # SHARD_CONFIG, REPLICA_PRIMARY, etc.) and are filtered per cluster
+        # by DNS domain inside summarize_cluster.
+        try:
+            processes = client.get_all(f"/groups/{pid}/processes")
+        except AtlasAPIError as e:
+            processes = []
+            print(f"[warn] {pname} ({pid}): /processes fetch failed, mongos "
+                  f"hostnames will be empty: {e}", file=sys.stderr)
         summarized = []
         for c in clusters:
-            entry = summarize_cluster(c)
+            entry = summarize_cluster(cfg=c, project_processes=processes)
             try:
-                deployment = _fetch_search_deployment(client, pid, entry["name"])
+                deployment = _fetch_search_deployment(client=client, project_id=pid,
+                                                      cluster_name=entry["name"])
             except AtlasAPIError as e:
                 entry["search"] = {"error": f"/search/deployment fetch: {e}"}
             else:
-                entry["search"] = summarize_search_deployment(deployment)
+                entry["search"] = summarize_search_deployment(deployment=deployment)
 
             # Auto-discover per-Search-Node hostnames via /search/indexes →
             # statusDetail[].hostname. Requires at least one Search index to
             # exist on the cluster; otherwise the list is empty.
-            short_hosts = _discover_search_node_hostnames(client, pid, entry["name"])
+            short_hosts = _discover_search_node_hostnames(client=client, project_id=pid,
+                                                          cluster_name=entry["name"])
             if short_hosts:
                 # /clusters LIST already includes connectionStrings, so `c` has
                 # the domain we need — no extra fetch required.

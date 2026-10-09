@@ -3,7 +3,7 @@ type, and always evaluate Atlas Search if it's present on the cluster.
 
   type == "replica_set" -> evaluate_replicaset
   type == "sharded"     -> evaluate_shard
-  type == "free_tier"   -> synthetic not_supported result (three-line pass-through)
+  type == "free_tier"   -> synthetic no_change result with "shared/free tier" reason
 
 Atlas Search is orthogonal to the mongod deployment shape (see
 src/extraction/extract_search_data.py:32-34), so this dispatcher always runs
@@ -22,20 +22,20 @@ def evaluate(extraction, thresholds, window):
     cluster_name = extraction.get("cluster", "")
 
     if t == "replica_set":
-        results = evaluate_replicaset.evaluate(extraction, thresholds, window)
+        results = evaluate_replicaset.evaluate(extraction=extraction, thresholds=thresholds, window=window)
     elif t == "sharded":
-        results = evaluate_shard.evaluate(extraction, thresholds, window)
+        results = evaluate_shard.evaluate(extraction=extraction, thresholds=thresholds, window=window)
     elif t == "free_tier":
         tier = extraction.get("tier") or "UNKNOWN"
         results = [{
             "cluster_name": cluster_name, "cluster": cluster_name,
             "current_tier": tier,
             "cluster_type": (extraction.get("config") or {}).get("cluster_type"),
-            "verdict": "not_supported", "confidence": "n/a",
+            "verdict": "no_change", "confidence": "n/a",
             "triggers": [], "borderline": [], "notes": [], "coverage": None, "nodes": [],
             "reasons": [extraction.get("reason") or
-                        f"Tier {tier} doesn't expose the hardware measurements the "
-                        f"rightsizing thresholds depend on."],
+                        f"Shared/free tier {tier} — doesn't expose the hardware "
+                        f"measurements the rightsizing thresholds depend on."],
         }]
     else:
         results = [{
@@ -48,7 +48,7 @@ def evaluate(extraction, thresholds, window):
 
     search = extraction.get("search")
     if search and search.get("present"):
-        search_result = evaluate_search.evaluate(search, thresholds, window)
+        search_result = evaluate_search.evaluate(search=search, thresholds=thresholds, window=window)
         if search_result:
             results.append(search_result)
     return results

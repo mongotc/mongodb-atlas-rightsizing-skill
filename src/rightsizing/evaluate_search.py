@@ -48,7 +48,7 @@ def evaluate(search, thresholds, window):
 
     per_node_results, triggers, borderline, node_rows, missing = [], [], [], [], []
     for node in search.get("search_nodes") or []:
-        r = _evaluate_search_node(node, thresholds, window)
+        r = _evaluate_search_node(node=node, thresholds=thresholds, window=window)
         per_node_results.append(r)
         triggers += r["triggers"]
         borderline += r["borderline"]
@@ -70,13 +70,13 @@ def evaluate(search, thresholds, window):
         })
 
     if not per_node_results:
-        return dict(base, verdict="insufficient_data", confidence="low",
+        return dict(base, verdict="no_change", confidence="low",
                     triggers=[], borderline=borderline, notes=[],
                     coverage=None, nodes=node_rows,
                     reasons=[
-                        "No per-Search-Node metrics were returned: dedicated Search Nodes "
-                        "aren't provisioned, no Search indexes have been created yet, or "
-                        "auto-discovery via /clusters/{name}/search/indexes failed."
+                        "Not enough data points: no per-Search-Node metrics were returned. "
+                        "Dedicated Search Nodes aren't provisioned, no Search indexes exist "
+                        "yet, or auto-discovery via /clusters/{name}/search/indexes failed."
                     ])
 
     trigger_ids = sorted({t["id"] for t in triggers})
@@ -88,17 +88,24 @@ def evaluate(search, thresholds, window):
         verdict = "scale_up"
         reasons = [t["text"] for t in triggers]
     elif all_down and window["days"] >= 7 and coverage >= thresholds.min_coverage and not borderline:
-        verdict = "scale_down_candidate"
+        verdict = "scale_down"
         reasons = [
             "Every Search Node is comfortably under the CPU and free-memory scale-down bars."
         ]
     else:
         verdict = "no_change"
-        reasons = ["No Search Node crossed the CPU or memory triggers."]
-        if borderline:
+        if window["days"] < 7 or coverage < thresholds.min_coverage:
             reasons = [
-                "No Search Node crossed the triggers, but some metrics are close (see below)."
+                f"Not enough data points: only {window['days']:.1f} days of data at "
+                f"{coverage:.0%} coverage. Need ≥ 7 days and ≥ "
+                f"{thresholds.min_coverage:.0%} coverage — collect more history and re-run."
             ]
+        else:
+            reasons = ["No Search Node crossed the CPU or memory triggers."]
+            if borderline:
+                reasons = [
+                    "No Search Node crossed the triggers, but some metrics are close (see below)."
+                ]
 
     notes = ["Search thresholds are heuristic (see references/search-thresholds.md when available); "
              "FTS_PROCESS_* metrics on mongod hosts are summarized for context but do not trigger."]
@@ -107,7 +114,9 @@ def evaluate(search, thresholds, window):
 
     return dict(
         base,
-        verdict=verdict, confidence=_confidence(verdict, window["days"], coverage, thresholds),
+        verdict=verdict,
+        confidence=_confidence(verdict=verdict, window_days=window["days"],
+                               coverage=coverage, thresholds=thresholds),
         triggers=trigger_ids, reasons=reasons, borderline=borderline, notes=notes,
         coverage=round(coverage, 3), nodes=node_rows,
     )
@@ -117,40 +126,41 @@ def _evaluate_search_node(node, thresholds, window):
     process_id = node.get("process_id", "unknown")
     host = ((node.get("data") or {}).get("host") or {})
 
-    cpu_pts = combine(host.get("SYSTEM_NORMALIZED_CPU_USER"),
-                      host.get("SYSTEM_NORMALIZED_CPU_KERNEL"),
-                      operator.add)
-    cpu = summarize(cpu_pts)
+    cpu_pts = combine(a=host.get("SYSTEM_NORMALIZED_CPU_USER"),
+                      b=host.get("SYSTEM_NORMALIZED_CPU_KERNEL"),
+                      fn=operator.add)
+    cpu = summarize(points=cpu_pts)
 
     mem_pts = [
         (ts, v) for ts, v in combine(
-            host.get("SYSTEM_MEMORY_FREE"), host.get("SYSTEM_MEMORY_USED"),
-            lambda free, used: 100.0 * free / (free + used) if free + used > 0 else None,
+            a=host.get("SYSTEM_MEMORY_FREE"),
+            b=host.get("SYSTEM_MEMORY_USED"),
+            fn=lambda free, used: 100.0 * free / (free + used) if free + used > 0 else None,
         ) if v is not None
     ]
-    mem = summarize(mem_pts)
+    mem = summarize(points=mem_pts)
 
     triggers, borderline = [], []
     if cpu:
-        if cpu["p95"] > thresholds.search.cpu_up_pct:
+        if cpu["p95"] > thresholds.mongot_host.cpu_up_pct:
             triggers.append({"id": "search_cpu", "text":
                 f"{process_id}: Search Node CPU (user+kernel) p95 {cpu['p95']}% > "
-                f"{thresholds.search.cpu_up_pct}%"})
-        elif cpu["p95"] >= thresholds.search.cpu_up_pct * (1 - thresholds.near_threshold):
+                f"{thresholds.mongot_host.cpu_up_pct}%"})
+        elif cpu["p95"] >= thresholds.mongot_host.cpu_up_pct * (1 - thresholds.near_threshold):
             borderline.append(
                 f"{process_id}: CPU p95 {cpu['p95']}% within "
-                f"{int(thresholds.near_threshold * 100)}% of the {thresholds.search.cpu_up_pct}% trigger"
+                f"{int(thresholds.near_threshold * 100)}% of the {thresholds.mongot_host.cpu_up_pct}% trigger"
             )
 
     if mem:
-        if mem["p5"] < thresholds.search.mem_free_up_pct:
+        if mem["p5"] < thresholds.mongot_host.mem_free_up_pct:
             triggers.append({"id": "search_memory", "text":
                 f"{process_id}: Search Node free memory p5 {mem['p5']}% < "
-                f"{thresholds.search.mem_free_up_pct}%"})
-        elif mem["p5"] <= thresholds.search.mem_free_up_pct * (1 + thresholds.near_threshold):
+                f"{thresholds.mongot_host.mem_free_up_pct}%"})
+        elif mem["p5"] <= thresholds.mongot_host.mem_free_up_pct * (1 + thresholds.near_threshold):
             borderline.append(
                 f"{process_id}: free memory p5 {mem['p5']}% within "
-                f"{int(thresholds.near_threshold * 100)}% of the {thresholds.search.mem_free_up_pct}% trigger"
+                f"{int(thresholds.near_threshold * 100)}% of the {thresholds.mongot_host.mem_free_up_pct}% trigger"
             )
 
     summary = {name: summarize(pts) for name, pts in host.items()}
@@ -166,8 +176,8 @@ def _evaluate_search_node(node, thresholds, window):
     expected = window["expected_samples"]
     coverage = min(min(len(s) / expected, 1.0) for s in core_series) if expected else 0.0
 
-    down_ok = bool(cpu and cpu["p95"] < thresholds.search.cpu_down_pct) \
-        and bool(mem and mem["p5"] > thresholds.search.mem_free_down_pct)
+    down_ok = bool(cpu and cpu["p95"] < thresholds.mongot_host.cpu_down_pct) \
+        and bool(mem and mem["p5"] > thresholds.mongot_host.mem_free_down_pct)
 
     missing = []
     if not cpu:
@@ -189,8 +199,6 @@ def _evaluate_search_node(node, thresholds, window):
 
 
 def _confidence(verdict, window_days, coverage, thresholds):
-    if verdict == "insufficient_data" or window_days < 3 or coverage < thresholds.min_coverage:
+    if window_days < 3 or coverage < thresholds.min_coverage:
         return "low"
-    if verdict == "scale_up":
-        return "medium" if window_days < 7 else "high"
     return "medium" if window_days < 7 else "high"

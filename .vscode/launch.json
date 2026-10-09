@@ -1,0 +1,261 @@
+{
+    "version": "0.2.0",
+    "inputs": [
+        {
+            "id": "extractionPath",
+            "type": "pickString",
+            "description": "extraction.json to use (shared between Rightsize + Visualize)",
+            "default": "${workspaceFolder}/output/persona/stack-0000/stack-0000/extraction.json",
+            "options": [
+                {
+                    "label": "stack-0000 / stack-0000",
+                    "value": "${workspaceFolder}/output/persona/stack-0000/stack-0000/extraction.json"
+                },
+                {
+                    "label": "persona-ci / buildkite-runner",
+                    "value": "${workspaceFolder}/output/persona/persona-ci/buildkite-runner/extraction.json"
+                },
+                {
+                    "label": "persona-data-products-prod / data-products",
+                    "value": "${workspaceFolder}/output/persona/persona-data-products-prod/data-products/extraction.json"
+                },
+                {
+                    "label": "armen.babakanian / Cluster0",
+                    "value": "${workspaceFolder}/output/Professional_Services_America/armen.babakanian/Cluster0/extraction.json"
+                },
+                {
+                    "label": "armen.babakanian / Cluster1",
+                    "value": "${workspaceFolder}/output/Professional_Services_America/armen.babakanian/Cluster1/extraction.json"
+                },
+                {
+                    "label": "armen.babakanian / Cluster2",
+                    "value": "${workspaceFolder}/output/Professional_Services_America/armen.babakanian/Cluster2/extraction.json"
+                }
+            ]
+        },
+        {
+            "id": "summaryPath",
+            "type": "pickString",
+            "description": "extraction_summary.json (bulk)",
+            "default": "${workspaceFolder}/output/persona/extraction_summary.json",
+            "options": [
+                "${workspaceFolder}/output/persona/extraction_summary.json",
+                "${workspaceFolder}/output/Professional_Services_America/extraction_summary.json"
+            ]
+        },
+        {
+            "id": "groupId",
+            "type": "pickString",
+            "description": "Atlas project / cluster (returns group ID)",
+            "default": "65de35aacee49637479edebd",
+            "options": [
+                {
+                    "label": "stack-0000 / stack-0000",
+                    "value": "65de35aacee49637479edebd"
+                },
+                {
+                    "label": "persona-ci / buildkite-runner",
+                    "value": "65a974002c733009f81a6a3e"
+                },
+                {
+                    "label": "persona-data-products-prod / data-products",
+                    "value": "69f540390d7996cda4bdefb2"
+                },
+                {
+                    "label": "armen.babakanian / Cluster0",
+                    "value": "674f42f21212e000bcbc3735"
+                }
+            ]
+        },
+        {
+            "id": "clusterName",
+            "type": "pickString",
+            "description": "Atlas project / cluster (returns cluster name) - pick the same label as groupId & projectName",
+            "default": "stack-0000",
+            "options": [
+                {
+                    "label": "stack-0000 / stack-0000",
+                    "value": "stack-0000"
+                },
+                {
+                    "label": "persona-ci / buildkite-runner",
+                    "value": "buildkite-runner"
+                },
+                {
+                    "label": "persona-data-products-prod / data-products",
+                    "value": "data-products"
+                },
+                {
+                    "label": "armen.babakanian / Cluster0",
+                    "value": "Cluster0"
+                }
+            ]
+        },
+        {
+            "id": "projectName",
+            "type": "pickString",
+            "description": "Atlas project / cluster (returns project name) - pick the same label as groupId & clusterName",
+            "default": "stack-0000",
+            "options": [
+                {
+                    "label": "stack-0000 / stack-0000",
+                    "value": "stack-0000"
+                },
+                {
+                    "label": "persona-ci / buildkite-runner",
+                    "value": "persona-ci"
+                },
+                {
+                    "label": "persona-data-products-prod / data-products",
+                    "value": "persona-data-products-prod"
+                },
+                {
+                    "label": "armen.babakanian / Cluster0",
+                    "value": "armen.babakanian"
+                }
+            ]
+        },
+        {
+            "id": "inventoryPath",
+            "type": "pickString",
+            "description": "inventory.json produced by Gather Info",
+            "default": "${workspaceFolder}/output/Professional_Services_America/inventory.json",
+            "options": [
+                "${workspaceFolder}/output/Professional_Services_America/inventory.json",
+                "${workspaceFolder}/output/persona/inventory.json"
+            ]
+        },
+        {
+            "id": "extractHours",
+            "type": "promptString",
+            "description": "Lookback in hours (<=36 for PT1M granularity). Blank = default 7 days.",
+            "default": "2"
+        }
+    ],
+    "configurations": [
+        {
+            "name": "Current file",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "envFile": "${workspaceFolder}/.env"
+        },
+        {
+            "name": "Rightsizing Bulk",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/rightsizing/rightsize_bulk.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "args": [
+                "--summary",
+                "${input:summaryPath}"
+            ]
+        },
+        {
+            "name": "Rightsize (single cluster)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/rightsizing/rightsize.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "args": [
+                "--extraction",
+                "${input:extractionPath}"
+            ]
+        },
+        {
+            "name": "Visualize (single cluster)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/visualize/visualize.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "args": [
+                "--extraction",
+                "${input:extractionPath}"
+            ]
+        },
+        {
+            "name": "Visualize Bulk",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/visualize/visualize_bulk.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "args": [
+                "--summary",
+                "${input:summaryPath}"
+            ]
+        },
+        {
+            "name": "Gather Info",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/discovery/gather_info.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "envFile": "${workspaceFolder}/.env"
+        },
+        {
+            "name": "Extract (single cluster)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/extraction/extract.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--group-id",
+                "${input:groupId}",
+                "--cluster",
+                "${input:clusterName}",
+                "--out",
+                "${workspaceFolder}/output/persona/${input:projectName}/${input:clusterName}/extraction.json"
+            ]
+        },
+        {
+            "name": "Extract (single cluster, recent hours)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/extraction/extract.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--group-id",
+                "${input:groupId}",
+                "--cluster",
+                "${input:clusterName}",
+                "--hours",
+                "${input:extractHours}",
+                "--out",
+                "${workspaceFolder}/output/persona/${input:projectName}/${input:clusterName}/extraction.json"
+            ]
+        },
+        {
+            "name": "Extract Bulk",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/extraction/extract_bulk.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "args": [
+                "--inventory",
+                "${input:inventoryPath}"
+            ]
+        }
+    ]
+}

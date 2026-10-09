@@ -16,10 +16,9 @@ still runs standalone against its own copy of these primitives.
 from .common import (
     AtlasAPIError,
     AtlasClient,
-    CORE_DISK_METRIC,
-    CORE_HOST_METRICS,
     DISK_METRICS,
     HOST_METRICS,
+    SEARCH_METRICS,
     SHARED_TIERS,
     cluster_host_keys,
     fetch_measurements,
@@ -44,10 +43,9 @@ def __getattr__(name):
 __all__ = [
     "AtlasAPIError",
     "AtlasClient",
-    "CORE_DISK_METRIC",
-    "CORE_HOST_METRICS",
     "DISK_METRICS",
     "HOST_METRICS",
+    "SEARCH_METRICS",
     "SHARED_TIERS",
     "cluster_host_keys",
     "extract_cluster",

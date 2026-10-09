@@ -26,7 +26,7 @@ def build_report_md(results, window, thresholds_source=None):
     """Return a markdown report of every result in `results`.
 
     `window` is the extraction window dict ({"days", "label", "granularity", ...}).
-    `thresholds_source` is the absolute path to the thresholds.yaml used
+    `thresholds_source` is the absolute path to the config.yaml used
     (printed in the footer so users can trace which knobs produced the verdict)."""
     lines = ["# Atlas Rightsizing Report", "",
              f"Lookback: {window['label']} (granularity {window['granularity']})  |  "
@@ -90,14 +90,10 @@ def build_report_json(results, window, thresholds_source=None, extras=None):
 # Ordering used for the summary table: verdicts that need attention first,
 # healthy ones next, informational rows last.
 _VERDICT_PRIORITY = {
-    "scale_up":             0,
-    "disk_iops_only":       1,
-    "insufficient_data":    2,
-    "scale_down_candidate": 3,
-    "no_change":            4,
-    "not_supported":        5,
-    "not_applicable":       6,
-    "error":                7,
+    "scale_up":   0,
+    "scale_down": 1,
+    "no_change":  2,
+    "error":      3,
 }
 
 
@@ -153,8 +149,8 @@ def build_summary_md(summary):
     # Per-cluster table.
     base_dir = os.path.dirname(os.path.abspath(summary.get("source_summary") or "")) \
         if summary.get("source_summary") else None
-    lines.append("| Project | Cluster | Status | Verdicts | Report |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Project | Cluster | Status | Verdicts | Reasoning | Report |")
+    lines.append("|---|---|---|---|---|---|")
     for e in entries:
         project = e.get("project") or e.get("project_id") or "-"
         cluster = e.get("cluster") or "-"
@@ -169,12 +165,21 @@ def build_summary_md(summary):
                 except ValueError:
                     pass  # Windows cross-drive; keep absolute
             report_link = f"[rightsizing.md]({path})"
-        row_note = ""
-        if status != "ok" and e.get("error"):
-            row_note = f" ({e['error']})"
-        elif status != "ok" and e.get("reason"):
-            row_note = f" ({e['reason']})"
-        lines.append(f"| {project} | {cluster} | {status}{row_note} | {verdicts} | {report_link} |")
+        # Reasoning: one line per evaluated unit. Pipes break md tables, so
+        # replace with escaped version; newlines render as <br> for readability.
+        if status == "ok":
+            reasoning_lines = []
+            for r in (e.get("reasoning") or []):
+                txt = (r.get("reason") or "").replace("|", "\\|").replace("\n", " ")
+                reasoning_lines.append(txt)
+            reasoning_cell = "<br>".join(reasoning_lines) or "-"
+        elif e.get("error"):
+            reasoning_cell = str(e["error"]).replace("|", "\\|").replace("\n", " ")
+        elif e.get("reason"):
+            reasoning_cell = str(e["reason"]).replace("|", "\\|").replace("\n", " ")
+        else:
+            reasoning_cell = "-"
+        lines.append(f"| {project} | {cluster} | {status} | {verdicts} | {reasoning_cell} | {report_link} |")
 
     lines.append("")
     lines.append("Each row links to the per-cluster report with the metric tables and reasons.")
@@ -186,7 +191,7 @@ def write_summary(summary, out_dir, name="rightsizing_summary.md"):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(build_summary_md(summary))
+        f.write(build_summary_md(summary=summary))
     return path
 
 
@@ -198,8 +203,10 @@ def write_report(results, window, out_dir, thresholds_source=None, extras=None,
     md_path = os.path.join(out_dir, md_name)
     json_path = os.path.join(out_dir, json_name)
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write(build_report_md(results, window, thresholds_source))
+        f.write(build_report_md(results=results, window=window,
+                                thresholds_source=thresholds_source))
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(build_report_json(results, window, thresholds_source, extras),
+        json.dump(build_report_json(results=results, window=window,
+                                    thresholds_source=thresholds_source, extras=extras),
                   f, indent=2, default=str)
     return md_path, json_path

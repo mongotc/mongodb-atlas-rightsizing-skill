@@ -1,0 +1,13 @@
+{
+    "schema_version": "1.0",
+    "product": "MongoDB Atlas Core - AZURE Cloud - Clusters",
+    "generated_on": "2026-10-06",
+    "cloud_provider": "azure",
+    "references": [
+        {
+            "desc": "the AZURE instance size name - TODO incomplete",
+            "variable_name": "AzureHardwareSpec20240805.instanceSize"
+        }
+    ],
+    "tiers": []
+}

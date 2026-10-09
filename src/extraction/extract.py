@@ -40,7 +40,9 @@ Sample call:
 
 import os
 
-import extract_free_tier_data, extract_gen1_data, extract_shard_data
+import yaml
+
+import extract_free_tier_data, extract_gen1_data, extract_search_data, extract_shard_data
 from common import AtlasAPIError, AtlasClient, SHARED_TIERS, tier_info
 
 SHARDED_CLUSTER_TYPES = {"SHARDED", "GEOSHARDED"}
@@ -51,10 +53,33 @@ SHARDED_CLUSTER_TYPES = {"SHARDED", "GEOSHARDED"}
 # from which the CLI is invoked.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+_CONFIG_PATH = os.path.normpath(os.path.join(_PROJECT_ROOT, "src", "config.yaml"))
+
+
+def _load_extraction_config():
+    """Read the `extraction:` section of src/config.yaml. Returns a dict with
+    default_days / default_hours / minute_granularity_hours. Falls back to
+    hard-coded defaults if the file or section is missing so a broken yaml
+    can't block an ad-hoc extraction."""
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        raw = {}
+    e = raw.get("extraction") or {}
+    return {
+        "default_days": e.get("default_days", 7),
+        "default_hours": e.get("default_hours"),  # None means "use days"
+        "minute_granularity_hours": int(e.get("minute_granularity_hours", 36)),
+    }
+
+
+_EXTRACTION_CFG = _load_extraction_config()
+
 
 def _pick_extractor(cluster_cfg):
     """Return the extractor module suited to this cluster."""
-    tiers, *_ = tier_info(cluster_cfg)
+    tiers, *_ = tier_info(cluster_cfg=cluster_cfg)
     if tiers and all(t in SHARED_TIERS for t in tiers):
         return extract_free_tier_data
     cluster_type = (cluster_cfg.get("clusterType") or "").upper()
@@ -75,10 +100,27 @@ def extract(client, group_id, cluster_cfg, window, processes):
 
     Returns whatever the chosen extractor returns; the "type" field on the
     result identifies which was used ("replica_set", "sharded", "free_tier").
+    Atlas Search is orthogonal to the mongod shape (any cluster shape can
+    independently have dedicated Search Nodes attached), so its result is
+    attached as a sibling `search` field. Mirrors the extract_bulk wiring —
+    search failures don't fail the whole extraction.
     """
-    return _pick_extractor(cluster_cfg).extract(
-        client, group_id, cluster_cfg, window, processes
+    result = _pick_extractor(cluster_cfg=cluster_cfg).extract(
+        client=client, group_id=group_id, cluster_cfg=cluster_cfg,
+        window=window, processes=processes,
     )
+    try:
+        result["search"] = extract_search_data.extract(
+            client=client, group_id=group_id, cluster_cfg=cluster_cfg,
+            window=window, processes=processes,
+        )
+    except AtlasAPIError as e:
+        result["search"] = {
+            "type": "search",
+            "cluster": cluster_cfg.get("name"),
+            "error": str(e),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -87,27 +129,35 @@ def extract(client, group_id, cluster_cfg, window, processes):
 # Package uses relative imports, so run via -m from the project root:
 #
 #   python -m src.extraction.extract --group-id "$ATLAS_GROUP_ID" \
-#                                    --cluster Cluster0 --days 7 \
+#                                    --cluster Cluster0 \
 #                                    --out ./extraction.json
 #
 # Prints the extractor's dict as JSON on stdout (or to --out). Reads Atlas
-# credentials from the same env vars as scripts/rightsizing.py.
+# credentials from the same env vars as scripts/rightsizing.py. Lookback
+# window (days/hours/granularity) is configured in src/config.yaml under
+# the `extraction:` section.
 # ---------------------------------------------------------------------------
 
-def _build_window(days, hours):
+def _build_window():
+    """Build the extraction window dict from src/config.yaml.
+
+    Reads `extraction.default_hours` first; if non-null, uses the hours path
+    (PT1M for short windows per `minute_granularity_hours`, else PT1H).
+    Otherwise uses `extraction.default_days` with PT1H granularity.
+    """
+    hours = _EXTRACTION_CFG["default_hours"]
     if hours is not None:
         if hours < 1:
-            raise ValueError("--hours must be >= 1")
-        # PT1M keeps 1-minute buckets for short windows; longer ones fall back to hourly.
-        granularity = "PT1M" if hours <= 36 else "PT1H"
+            raise ValueError("extraction.default_hours must be >= 1")
+        granularity = "PT1M" if hours <= _EXTRACTION_CFG["minute_granularity_hours"] else "PT1H"
         return {
             "days": hours / 24, "label": f"{hours} hours",
             "period": f"PT{hours}H", "granularity": granularity,
             "expected_samples": hours * 60 if granularity == "PT1M" else hours,
         }
-    days = 7 if days is None else days
+    days = _EXTRACTION_CFG["default_days"]
     if days < 1:
-        raise ValueError("--days must be >= 1")
+        raise ValueError("extraction.default_days must be >= 1")
     return {
         "days": float(days), "label": f"{days} days",
         "period": f"P{days}D", "granularity": "PT1H",
@@ -115,8 +165,6 @@ def _build_window(days, hours):
     }
 
 
-DEFAULT_DAYS = 7
-DEFAULT_HOURS = None
 # OUTPUT_DIR env var, if set, is treated as a path *relative to the project
 # root* — e.g. OUTPUT_DIR=output puts files under <root>/output/<cluster>/...
 # Absolute OUTPUT_DIR paths are respected as-is (os.path.join drops the root
@@ -126,22 +174,18 @@ DEFAULT_OUT_TEMPLATE = os.path.join(
 )
 
 
-def _main(argv=None):
+def console_main(argv=None):
     import argparse
     import json
     import os
     import sys
 
     ap = argparse.ArgumentParser(
-        description="Extract raw Atlas metrics for one cluster and print as JSON.",
+        description="Extract raw Atlas metrics for one cluster and print as JSON. "
+                    "Lookback window is configured in src/config.yaml under `extraction:`.",
     )
     ap.add_argument("--group-id", required=True, help="Atlas project (group) ID")
     ap.add_argument("--cluster", required=True, help="Cluster name")
-    ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
-                    help="Lookback window in days (default: %(default)s)")
-    ap.add_argument("--hours", type=int, default=DEFAULT_HOURS,
-                    help="Lookback in hours for a live spot-check; overrides --days "
-                         "(1-minute granularity up to 36 hours) (default: %(default)s)")
     ap.add_argument("--out", default=DEFAULT_OUT_TEMPLATE,
                     help="Output JSON path (default: %(default)s). "
                          "'{cluster}' in the path is replaced with the cluster name; "
@@ -149,7 +193,7 @@ def _main(argv=None):
     args = ap.parse_args(argv)
 
     try:
-        window = _build_window(args.days, args.hours)
+        window = _build_window()
     except ValueError as e:
         ap.error(str(e))
 
@@ -164,7 +208,13 @@ def _main(argv=None):
     except AtlasAPIError as e:
         sys.exit(f"Atlas API error: {e}")
 
-    result = extract(client, args.group_id, cluster_cfg, window, processes)
+    result = extract(client=client, group_id=args.group_id, cluster_cfg=cluster_cfg,
+                     window=window, processes=processes)
+    # Stamp identity onto the result so the file is self-describing.
+    result.update({
+        "cluster": args.cluster,
+        "project_id": args.group_id,
+    })
     payload = json.dumps(result, indent=2, default=str)
 
     if args.out == "-":
@@ -180,4 +230,4 @@ def _main(argv=None):
 
 if __name__ == "__main__":
     import sys
-    sys.exit(_main())
+    sys.exit(console_main())
