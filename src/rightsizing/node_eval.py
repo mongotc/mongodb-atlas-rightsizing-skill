@@ -59,10 +59,23 @@ class EvalContext(TypedDict, total=False):
 class EvalResult(TypedDict):
     triggers: list[Trigger]
     borderline: list[str]
-    down_checks: dict[str, bool]
+    down_checks: dict[str, Optional[bool]]
     summary: dict[str, Summary]
     coverage: float
+    compute_coverage: float
+    disk_coverage: float
+    disk_sparse: bool
     missing: list[str]
+
+
+# Below this per-node disk-coverage threshold (measured over the host eval
+# window after trimming), we treat the node's disk data as absent: no disk
+# triggers fire, the disk down-check is `None` (unknown, which blocks
+# scale_down), and the group aggregator logs the node. Atlas's device-rename
+# series resets can push disk_coverage well below 50% for individual nodes
+# while compute metrics stay complete — see docstring of this module and the
+# `extraction.disk_days` knob in src/config.yaml.
+DISK_SPARSE_THRESHOLD = 0.50
 
 
 # (trigger, borderline, summary). trigger and borderline are None when the
@@ -121,6 +134,51 @@ def check_high(
     return None, None, s
 
 
+def _earliest_host_timestamp(host):
+    """Earliest ISO-8601 timestamp across all host series. Returns None when
+    no host series carry data. Timestamps are UTC Zulu strings, which sort
+    lexically — no need to parse."""
+    best = None
+    for s in host.values():
+        if not s:
+            continue
+        t = s[0][0]
+        if best is None or t < best:
+            best = t
+    return best
+
+
+def _trim_disks_to_window(disks, start):
+    """Return a copy of `disks` with every per-metric series filtered to
+    points at or after `start`. Used to align disk-partition data (fetched
+    over a wider window) with the host evaluation window."""
+    if not start:
+        return disks
+    out = {}
+    for part, metrics in disks.items():
+        out[part] = {
+            name: [p for p in (series or []) if p[0] >= start]
+            for name, series in metrics.items()
+        }
+    return out
+
+
+def _per_node_disk_coverage(disks, expected):
+    """Coverage of the per-partition CORE_DISK_METRIC series over the host
+    eval window. Returns 1.0 when the node has no disks (not applicable —
+    e.g. a mongos router) so the group aggregator doesn't flag it. Returns
+    0.0 when disks exist but CORE_DISK_METRIC is missing."""
+    if not disks or not expected:
+        return 1.0
+    counts = [
+        len(metrics.get(CORE_DISK_METRIC) or [])
+        for metrics in disks.values()
+    ]
+    if not counts:
+        return 1.0
+    return min(min(n / expected, 1.0) for n in counts)
+
+
 def evaluate_node(
     data: NodeData,
     ctx: EvalContext,
@@ -128,8 +186,22 @@ def evaluate_node(
 ) -> EvalResult:
     """Apply thresholds to one node. See module-level TypedDicts for the
     shapes of `data`, `ctx` and the return value."""
-    host, disks = data.get("host", {}), data.get("disks", {})
+    host, disks_raw = data.get("host", {}), data.get("disks", {})
     window = ctx["window"]
+    # Disk-partition metrics are fetched with a wider window than host
+    # metrics (see extraction.disk_days). Trim them to the host window
+    # before any summarization so disk p95s reflect the same time slice as
+    # compute signals.
+    host_window_start = _earliest_host_timestamp(host)
+    disks_trimmed = _trim_disks_to_window(disks_raw, start=host_window_start) if disks_raw else {}
+    expected_compute = window.get("expected_compute_samples", window.get("expected_samples", 0))
+    disk_coverage = _per_node_disk_coverage(disks_trimmed, expected_compute)
+    # When a node's disk history is below the sparsity floor, drop it from
+    # the per-node evaluation entirely: no disk triggers, no disk down-check
+    # vote (set to None/unknown so scale_down can't claim "safe" without
+    # evidence). The group aggregator will log the node by name.
+    disk_sparse = bool(disks_raw) and disk_coverage < DISK_SPARSE_THRESHOLD
+    disks = {} if disk_sparse else disks_trimmed
     triggers: list[Trigger] = []
     borderline: list[str] = []
     summary = {name: summarize(pts) for name, pts in host.items()}
@@ -319,19 +391,35 @@ def evaluate_node(
                     for lat in latencies)
         )
 
-    # Missing core metrics + coverage
+    # Missing core metrics
     missing = [m for m in CORE_HOST_METRICS if not host.get(m)]
-    if disks and not any(m.get(CORE_DISK_METRIC) for m in disks.values()):
+    # CORE_DISK_METRIC is only considered "missing" when disks were reported
+    # but the metric wasn't — not when disk data was dropped due to sparsity
+    # (that's reported via disk_sparse instead).
+    if disks_raw and not disk_sparse and not any(
+        m.get(CORE_DISK_METRIC) for m in disks_raw.values()
+    ):
         missing.append(CORE_DISK_METRIC)
-    core_series = [host.get(m) or [] for m in CORE_HOST_METRICS]
-    core_series += [m.get(CORE_DISK_METRIC) or [] for m in (disks.values() or [{}])]
-    expected = window["expected_samples"]
-    coverage = min(min(len(s) / expected, 1.0) for s in core_series) if expected else 0.0
+
+    # Compute coverage per compute series (CPU/memory), checked against the
+    # host window expected_samples. Disk coverage was computed above against
+    # the same denominator (post-trim). Legacy `coverage` is min of both so
+    # existing callers keep their worst-case view.
+    compute_series = [host.get(m) or [] for m in CORE_HOST_METRICS]
+    compute_coverage = (
+        min(min(len(s) / expected_compute, 1.0) for s in compute_series)
+        if expected_compute else 0.0
+    )
+    coverage = min(compute_coverage, disk_coverage) if disks_raw else compute_coverage
 
     down_checks = {
         "cpu":         bool(cpu and cpu["p95"] < thresholds.cpu_down_pct),
         "memory":      bool(mem and mem["p5"] > thresholds.mem_free_down_pct),
-        "disk":        bool(disk_down) and all(disk_down),
+        # When disk data is dropped for sparsity, the disk down-check is
+        # unknown (None), which blocks scale_down via Python's falsy-aware
+        # `all()` without silently passing.
+        "disk":        (None if disk_sparse
+                        else (bool(disk_down) and all(disk_down))),
         "page_faults": page_faults is None or page_faults["p95"] < thresholds.page_faults_down_per_sec,
         "cache_fill":  cache_fill is None or cache_fill["p95"] < thresholds.cache_fill_down_pct,
         "dirty_fill":  dirty_fill is None or dirty_fill["p95"] < thresholds.dirty_fill_down_pct,
@@ -347,5 +435,8 @@ def evaluate_node(
         "down_checks": down_checks,
         "summary": summary,
         "coverage": round(coverage, 3),
+        "compute_coverage": round(compute_coverage, 3),
+        "disk_coverage": round(disk_coverage, 3),
+        "disk_sparse": disk_sparse,
         "missing": missing,
     }

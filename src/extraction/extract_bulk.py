@@ -55,6 +55,21 @@ def _slugify(name):
     return slug or "unknown"
 
 
+def _window_metadata(window):
+    """Serializable snapshot of the window used to fetch this extraction.
+
+    Includes the host sub-window (days/period/granularity) and the disk
+    sub-window (just period/days, since granularity is shared) so downstream
+    evaluators know how the two series were sized."""
+    disk_sub = window.get("disk") or {}
+    return {
+        "days": window.get("days"), "label": window.get("label"),
+        "period": window["period"], "granularity": window["granularity"],
+        "disk": {"period": disk_sub.get("period", window["period"]),
+                 "days": disk_sub.get("days", window.get("days"))},
+    }
+
+
 def _load_inventory(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -106,7 +121,8 @@ def _extract_one(client, project, cluster, processes, window, base_out_dir):
         result["search"] = {"type": "search", "cluster": cname, "error": str(e)}
 
     # Stamp identity onto the result so a stray file is self-describing.
-    result.update({"cluster": cname, "project_id": pid, "project_name": pname})
+    result.update({"cluster": cname, "project_id": pid, "project_name": pname,
+                   "window": _window_metadata(window=window)})
     out_path = os.path.join(base_out_dir, _slugify(name=pname), cname, "extraction.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

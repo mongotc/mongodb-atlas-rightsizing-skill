@@ -43,13 +43,14 @@ def evaluate(extraction, thresholds, window):
             cluster=f"{cluster_name} - mongos routers ({len(routers)})",
             verdict="no_change", confidence="n/a",
             triggers=[], borderline=[], notes=[], coverage=None,
+            compute_coverage=None, disk_coverage=None,
             reasons=[
                 "mongos routers have no local storage or WiredTiger cache — shown for "
                 "visibility only, not evaluated against the rightsizing thresholds."
             ],
             nodes=[{
                 "node": n["label"], "role": n.get("role"), "hosts": n.get("hosts", []),
-                "coverage": None,
+                "coverage": None, "compute_coverage": None, "disk_coverage": None,
                 "metric_summary": {k: summarize(v) for k, v in (n.get("data") or {}).get("host", {}).items()},
             } for n in routers],
         ))

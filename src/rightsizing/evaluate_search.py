@@ -65,14 +65,15 @@ def evaluate(search, thresholds, window):
             "node": f"{mh.get('label')} (FTS on mongod, context)",
             "role": mh.get("role"),
             "hosts": mh.get("hosts", []),
-            "coverage": None,
+            "coverage": None, "compute_coverage": None, "disk_coverage": None,
             "metric_summary": {k: summarize(v) for k, v in fts.items()},
         })
 
     if not per_node_results:
         return dict(base, verdict="no_change", confidence="low",
                     triggers=[], borderline=borderline, notes=[],
-                    coverage=None, nodes=node_rows,
+                    coverage=None, compute_coverage=None, disk_coverage=None,
+                    nodes=node_rows,
                     reasons=[
                         "Not enough data points: no per-Search-Node metrics were returned. "
                         "Dedicated Search Nodes aren't provisioned, no Search indexes exist "
@@ -112,13 +113,19 @@ def evaluate(search, thresholds, window):
     if missing:
         notes += missing
 
+    # Search Nodes have no local disk partitions exposed to Atlas monitoring,
+    # so disk_coverage mirrors compute_coverage. Both are reported for a
+    # consistent result shape across cluster types.
     return dict(
         base,
         verdict=verdict,
         confidence=_confidence(verdict=verdict, window_days=window["days"],
                                coverage=coverage, thresholds=thresholds),
         triggers=trigger_ids, reasons=reasons, borderline=borderline, notes=notes,
-        coverage=round(coverage, 3), nodes=node_rows,
+        coverage=round(coverage, 3),
+        compute_coverage=round(coverage, 3),
+        disk_coverage=round(coverage, 3),
+        nodes=node_rows,
     )
 
 
@@ -188,7 +195,10 @@ def _evaluate_search_node(node, thresholds, window):
     return {
         "row": {
             "node": process_id, "role": "SEARCH_NODE", "hosts": [process_id.split(":", 1)[0]],
-            "coverage": round(coverage, 3), "metric_summary": summary,
+            "coverage": round(coverage, 3),
+            "compute_coverage": round(coverage, 3),
+            "disk_coverage": round(coverage, 3),
+            "metric_summary": summary,
         },
         "triggers": triggers,
         "borderline": borderline,

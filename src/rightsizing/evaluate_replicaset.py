@@ -20,11 +20,25 @@ from constants.tiers import SHARED_TIERS, TIER_MAX_CONNECTIONS, normalize_tier  
 from constants.verdicts import DISK_TRIGGERS  # noqa: E402
 
 from autoscaling import autoscaling_notes  # noqa: E402
-from node_eval import evaluate_node  # noqa: E402
+from node_eval import DISK_SPARSE_THRESHOLD, evaluate_node  # noqa: E402
 
 
-def _confidence(verdict, trigger_ids, window_days, coverage, borderline, missing, thresholds):
-    if window_days < 3 or coverage < thresholds.min_coverage or missing:
+def _confidence(verdict, trigger_ids, window_days, compute_coverage, disk_coverage,
+                borderline, missing, thresholds):
+    """Gate coverage differently depending on which triggers fired.
+
+    Compute-only scale-up verdicts (cpu/memory/cache/queues/connections)
+    don't need disk evidence — if compute history is complete, we can be
+    confident even when disk-partition metrics are sparse from an Atlas
+    device-rename reset. Disk-triggered scale-ups and all scale-down
+    verdicts still require both coverages above the floor."""
+    disk_touched = bool(set(trigger_ids) & set(DISK_TRIGGERS))
+    effective_coverage = (
+        min(compute_coverage, disk_coverage)
+        if disk_touched or verdict == "scale_down"
+        else compute_coverage
+    )
+    if window_days < 3 or effective_coverage < thresholds.min_coverage or missing:
         return "low"
     if verdict == "scale_up":
         if window_days < 7 or len(trigger_ids) < 2:
@@ -86,10 +100,14 @@ def evaluate_group(nodes, ctx, thresholds, window):
     
     per_node = [(n, evaluate_node(data=n["data"], ctx={**ctx, "window": window}, thresholds=thresholds))
                 for n in nodes]
-    
+
     node_rows = [
         {"node": n["label"], "role": n.get("role"), "hosts": n.get("hosts", []),
-         "coverage": r["coverage"], "metric_summary": r["summary"]}
+         "coverage": r["coverage"],
+         "compute_coverage": r["compute_coverage"],
+         "disk_coverage": r["disk_coverage"],
+         "disk_sparse": r["disk_sparse"],
+         "metric_summary": r["summary"]}
         for n, r in per_node
     ]
 
@@ -102,7 +120,8 @@ def evaluate_group(nodes, ctx, thresholds, window):
                 "No processes matched, or the cluster is too new, paused, or unreachable. "
                 "Re-run once the cluster has operating history."
             ],
-            "coverage": 0.0, "nodes": node_rows, "notes": [],
+            "coverage": 0.0, "compute_coverage": 0.0, "disk_coverage": 0.0,
+            "nodes": node_rows, "notes": [],
         }
 
     triggers, borderline, notes = [], [], []
@@ -115,14 +134,33 @@ def evaluate_group(nodes, ctx, thresholds, window):
         if r["missing"]:
             notes.append(f"{n['label']}: missing core metrics {', '.join(r['missing'])}")
     missing = any(r["missing"] for _, r in per_node)
-    coverage = min(r["coverage"] for _, r in per_node)
+    compute_coverage = min(r["compute_coverage"] for _, r in per_node)
+    # Group disk coverage: worst among nodes that weren't dropped for
+    # sparsity. If every node was dropped, there is no disk coverage.
+    non_sparse_disk = [r["disk_coverage"] for _, r in per_node if not r["disk_sparse"]]
+    disk_coverage = min(non_sparse_disk) if non_sparse_disk else 0.0
+    coverage = min(compute_coverage, disk_coverage) if non_sparse_disk else compute_coverage
+    sparse_nodes = [(n["label"], r["disk_coverage"]) for n, r in per_node if r["disk_sparse"]]
     trigger_ids = {t["id"] for t in triggers}
 
-    if coverage < thresholds.min_coverage:
+    if sparse_nodes:
+        details = ", ".join(f"{label} ({cov:.0%})" for label, cov in sparse_nodes)
         notes.append(
-            f"Data coverage is {coverage:.0%} of the expected samples for the lowest "
-            f"node/metric (gaps from restarts, a cluster younger than the window, or "
-            f"missing data)."
+            f"Disk-partition metrics are below {int(DISK_SPARSE_THRESHOLD * 100)}% "
+            f"coverage on {len(sparse_nodes)} node(s): {details}. Likely cause: an "
+            f"Atlas-side device rename (fleet maintenance, upgrade, or disk resize) "
+            f"that resets the per-partition series under a new device name. Compute "
+            f"signals (CPU/memory/cache/queues/connections) remain reliable; disk "
+            f"triggers and the scale-down disk check are skipped for the affected nodes."
+        )
+
+    # Compute-coverage warning only — disk sparsity has its own dedicated note
+    # above, no need to double-report.
+    if compute_coverage < thresholds.min_coverage:
+        notes.append(
+            f"Compute coverage is {compute_coverage:.0%} of the expected samples "
+            f"for the lowest node/metric (gaps from restarts, a cluster younger "
+            f"than the window, or missing data)."
         )
 
     if triggers:
@@ -139,8 +177,9 @@ def evaluate_group(nodes, ctx, thresholds, window):
             "Not enough data points: core metrics (CPU, memory or disk space) are missing "
             "for at least one node. Re-extract and re-run."
         ]
-    elif (all(all(r["down_checks"].values()) for _, r in per_node)
-          and window["days"] >= 7 and coverage >= thresholds.min_coverage
+    elif (all(all(v is True for v in r["down_checks"].values()) for _, r in per_node)
+          and window["days"] >= 7 and compute_coverage >= thresholds.min_coverage
+          and disk_coverage >= thresholds.min_coverage
           and not borderline):
         verdict = "scale_down"
         reasons = [
@@ -149,13 +188,15 @@ def evaluate_group(nodes, ctx, thresholds, window):
         ]
     else:
         verdict = "no_change"
-        # Data-sparsity short-circuits any other analysis — if the window is
-        # too short or coverage is too low, no scale-down (or scale-down-block)
-        # reasoning is trustworthy. Report only "not enough data points".
-        expected = int(window.get("expected_samples") or 0)
-        actual = int(round(coverage * expected)) if expected else 0
-        if window["days"] < 7 or coverage < thresholds.min_coverage:
-            if expected and coverage < thresholds.min_coverage:
+        # Data-sparsity short-circuits any other analysis — if the compute
+        # window is too short or compute coverage is too low, no scale-down
+        # reasoning is trustworthy. Disk sparsity gets its own note above
+        # and doesn't trigger a "not enough data" verdict reason here.
+        expected = int(window.get("expected_compute_samples")
+                       or window.get("expected_samples") or 0)
+        actual = int(round(compute_coverage * expected)) if expected else 0
+        if window["days"] < 7 or compute_coverage < thresholds.min_coverage:
+            if expected and compute_coverage < thresholds.min_coverage:
                 reasons = [
                     f"Not enough data points: {actual} of {expected} expected samples "
                     f"({window['days']:.1f} days). Need ≥ 7 days and ≥ "
@@ -168,10 +209,12 @@ def evaluate_group(nodes, ctx, thresholds, window):
                     f"(need ≥ 7). Collect more history and re-run."
                 ]
         else:
-            # Full-coverage, 7+ day window — now the down_checks and borderline
-            # signals are meaningful.
+            # Full compute coverage, 7+ day window — now the down_checks and
+            # borderline signals are meaningful. `None` entries in down_checks
+            # mean the signal was skipped (disk-sparse node), surface those
+            # with a suffix so the operator sees why.
             failed = sorted({
-                name for _, r in per_node for name, ok in r["down_checks"].items() if not ok
+                name for _, r in per_node for name, ok in r["down_checks"].items() if ok is not True
             })
             if failed:
                 reasons = [f"No scale-up thresholds crossed; scale-down bars not met for: "
@@ -187,7 +230,9 @@ def evaluate_group(nodes, ctx, thresholds, window):
     return {
         "verdict": verdict,
         "confidence": _confidence(verdict=verdict, trigger_ids=trigger_ids,
-                                  window_days=window["days"], coverage=coverage,
+                                  window_days=window["days"],
+                                  compute_coverage=compute_coverage,
+                                  disk_coverage=disk_coverage,
                                   borderline=borderline, missing=missing,
                                   thresholds=thresholds),
         "triggers": sorted(trigger_ids),
@@ -195,6 +240,8 @@ def evaluate_group(nodes, ctx, thresholds, window):
         "borderline": borderline,
         "notes": notes,
         "coverage": round(coverage, 3),
+        "compute_coverage": round(compute_coverage, 3),
+        "disk_coverage": round(disk_coverage, 3),
         "nodes": node_rows,
     }
 
@@ -214,7 +261,8 @@ def evaluate(extraction, thresholds, window):
 
     if is_shared_only:
         return [dict(base, cluster=cluster_name, verdict="no_change", confidence="n/a",
-                     triggers=[], borderline=[], notes=[], coverage=None, nodes=[],
+                     triggers=[], borderline=[], notes=[], coverage=None,
+                     compute_coverage=None, disk_coverage=None, nodes=[],
                      reasons=["Shared/free/flex/serverless tier — hardware measurements aren't "
                               "exposed, so the rightsizing thresholds can't be evaluated."])]
 

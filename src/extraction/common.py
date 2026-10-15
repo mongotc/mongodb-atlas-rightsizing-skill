@@ -236,11 +236,19 @@ def fetch_node_metrics(client, group_id, process_id, window, host_only=False,
     host_metrics overrides the default HOST_METRICS list — used for mongos
     routers (pass atlas_mongos_metrics.ALL_METRICS.keys()) so routers get
     their full catalog instead of the mongod-biased default (which captures
-    only ~7 of ~97 mongos metrics after Atlas drops the WT-only names)."""
+    only ~7 of ~97 mongos metrics after Atlas drops the WT-only names).
+
+    Disk-partition metrics are fetched with `window["disk"]["period"]` when
+    present (default: same as host). Atlas resets per-partition series under
+    new device names on fleet maintenances, so a wider disk window makes it
+    more likely the pre-rename series is still joinable."""
     base = f"/groups/{group_id}/processes/{process_id}"
-    query = [("granularity", window["granularity"]), ("period", window["period"])]
+    host_query = [("granularity", window["granularity"]), ("period", window["period"])]
+    disk_window = window.get("disk") or {}
+    disk_query = [("granularity", window["granularity"]),
+                  ("period", disk_window.get("period", window["period"]))]
     host = fetch_measurements(client=client, measurements_path=f"{base}/measurements",
-                              query=query,
+                              query=host_query,
                               metric_names=list(host_metrics) if host_metrics is not None else HOST_METRICS)
     disks = {}
     if not host_only:
@@ -250,7 +258,7 @@ def fetch_node_metrics(client, group_id, process_id, window, host_only=False,
                 disks[name] = fetch_measurements(
                     client=client,
                     measurements_path=f"{base}/disks/{name}/measurements",
-                    query=query, metric_names=DISK_METRICS,
+                    query=disk_query, metric_names=DISK_METRICS,
                 )
     return {"host": host, "disks": disks}
 
@@ -428,11 +436,19 @@ def _summarize_regions(cluster_cfg):
                 or electable.get("instanceSize")
                 or rc.get("instanceSize")
             )
-            node_count = (
+            electable_count = (
                 effective.get("nodeCount")
                 or electable.get("nodeCount")
                 or rc.get("nodeCount")
+                or 0
             )
+            read_only_count = (
+                (rc.get("readOnlySpecs") or {}).get("nodeCount") or 0
+            )
+            analytics_count = (
+                (rc.get("analyticsSpecs") or {}).get("nodeCount") or 0
+            )
+            node_count = electable_count + read_only_count + analytics_count
             # Per-regionConfig provisioned IOPS. Prefer effectiveElectableSpecs
             # (reflects autoscale drift) then electableSpecs, then the
             # regionConfig-level field (sharded shape). None = not reported.
@@ -471,6 +487,9 @@ def _summarize_regions(cluster_cfg):
                 "storage": storage,
                 "generation": gen,
                 "node_count": node_count,
+                "electable_count": electable_count,
+                "read_only_count": read_only_count,
+                "analytics_count": analytics_count,
                 "disk_iops": disk_iops,
                 "disk_size_gb": disk_size_gb,
                 "ebs_volume_type": ebs_volume_type,

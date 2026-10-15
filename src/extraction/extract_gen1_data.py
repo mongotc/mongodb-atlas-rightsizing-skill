@@ -22,7 +22,7 @@ from common import (
 )
 
 
-def extract(client, group_id, cluster_cfg, window, processes):
+def extract(client, group_id, cluster_cfg, window, processes, tier_specs=None):
     """Return raw metrics for every node in the replica set.
 
     Args:
@@ -31,6 +31,9 @@ def extract(client, group_id, cluster_cfg, window, processes):
         cluster_cfg:  Cluster config dict (from GET /groups/{gid}/clusters/{name}).
         window:       {"granularity": "PT1H", "period": "P7D", ...}
         processes:    All processes for the project (from GET /groups/{gid}/processes).
+        tier_specs:   list[TierSpec | None], one per regionConfig in
+                      summarize_config(cluster_cfg)["regions"]. Resolved by
+                      the extract.py dispatcher.
 
     Returns:
         {

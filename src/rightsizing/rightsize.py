@@ -31,25 +31,49 @@ from thresholds import DEFAULT_YAML_PATH, load_thresholds
 def _window_from_extraction(extraction, default_days=7):
     """Rebuild the window dict used by node_eval.evaluate_node.
 
-    Extraction doesn't currently persist the window it was collected under.
-    Reconstruct expected_samples from the first metric series we can find,
-    falling back to `default_days` * 24 hourly samples if the extraction is
-    empty. This isn't perfect but it lets the sustained-days check remain
-    meaningful without adding a required CLI flag."""
-    n = 0
-    for node in extraction.get("nodes") or []:
-        for series in ((node.get("data") or {}).get("host") or {}).values():
-            n = max(n, len(series or []))
-    for shard in (extraction.get("shards") or {}).values():
-        for node in shard:
+    Prefers the `window` field stamped onto the extraction (both host and
+    disk sub-windows); falls back to reconstructing host sample counts from
+    the first host-metric series. Disk sample counts are tracked separately
+    because disks are fetched over a wider window than host metrics — see
+    src/config.yaml:extraction.disk_days."""
+    def iter_host_series():
+        for node in extraction.get("nodes") or []:
             for series in ((node.get("data") or {}).get("host") or {}).values():
-                n = max(n, len(series or []))
-    if n <= 0:
-        n = default_days * 24
-    days = max(n / 24.0, 1.0)
+                yield series or []
+        for shard in (extraction.get("shards") or {}).values():
+            for node in shard:
+                for series in ((node.get("data") or {}).get("host") or {}).values():
+                    yield series or []
+
+    def iter_disk_series():
+        def by_node(nodes):
+            for n in nodes:
+                for metrics in ((n.get("data") or {}).get("disks") or {}).values():
+                    for series in metrics.values():
+                        yield series or []
+        yield from by_node(extraction.get("nodes") or [])
+        for shard in (extraction.get("shards") or {}).values():
+            yield from by_node(shard)
+
+    stamped = extraction.get("window") or {}
+    host_n = max((len(s) for s in iter_host_series()), default=0)
+    disk_n = max((len(s) for s in iter_disk_series()), default=0)
+    if host_n <= 0:
+        host_n = default_days * 24
+
+    days = max(host_n / 24.0, 1.0)
+    disk_days_stamped = (stamped.get("disk") or {}).get("days")
+    if disk_days_stamped:
+        expected_disk = int(disk_days_stamped) * 24
+    else:
+        expected_disk = disk_n or host_n
+
     return {
-        "days": days, "label": f"~{n} hourly samples", "period": f"P{int(days)}D",
-        "granularity": "PT1H", "expected_samples": n or 1,
+        "days": days, "label": f"~{host_n} hourly samples",
+        "period": f"P{int(days)}D", "granularity": "PT1H",
+        "expected_samples": host_n or 1,
+        "expected_compute_samples": host_n or 1,
+        "expected_disk_samples": expected_disk or 1,
     }
 
 

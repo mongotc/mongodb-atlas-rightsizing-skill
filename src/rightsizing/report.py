@@ -44,7 +44,20 @@ def build_report_md(results, window, thresholds_source=None):
             lines += ["", "**Close to a trigger:**"] + [f"- {b}" for b in r["borderline"]]
         if r.get("notes"):
             lines += ["", "**Notes:**"] + [f"- {n}" for n in r["notes"]]
-        if r.get("coverage") is not None:
+        # Prefer split compute/disk coverage when available; fall back to the
+        # legacy combined `coverage` otherwise. Disks are fetched over a wider
+        # window than host metrics and can be sparse due to Atlas-side device
+        # renames without affecting compute signal quality.
+        comp_cov, disk_cov = r.get("compute_coverage"), r.get("disk_coverage")
+        if comp_cov is not None or disk_cov is not None:
+            parts = []
+            if comp_cov is not None:
+                parts.append(f"compute {comp_cov:.0%}")
+            if disk_cov is not None:
+                parts.append(f"disk {disk_cov:.0%}")
+            lines += ["", f"Data coverage: {', '.join(parts)} of expected samples "
+                          f"(lowest node/core metric)."]
+        elif r.get("coverage") is not None:
             lines += ["", f"Data coverage: {r['coverage']:.0%} of expected samples "
                           f"(lowest node/core metric)."]
         lines.append("")
@@ -57,6 +70,16 @@ def build_report_md(results, window, thresholds_source=None):
                 heading += f" ({node['role']})"
             lines.append(heading)
             lines.append("")
+            n_comp, n_disk = node.get("compute_coverage"), node.get("disk_coverage")
+            if n_comp is not None or n_disk is not None:
+                parts = []
+                if n_comp is not None:
+                    parts.append(f"compute {n_comp:.0%}")
+                if n_disk is not None:
+                    parts.append(f"disk {n_disk:.0%}")
+                suffix = " — disk data dropped (below sparsity floor)" if node.get("disk_sparse") else "."
+                lines.append(f"Coverage: {', '.join(parts)}{suffix}")
+                lines.append("")
             lines.append("| Metric | p5 | p50 | p95 | max | samples |")
             lines.append("|---|---|---|---|---|---|")
             lines += [f"| {k} | {s['p5']} | {s['p50']} | {s['p95']} | {s['max']} | {s['n']} |"

@@ -3,7 +3,7 @@
 OpenAPI file: https://www.mongodb.com/docs/api/doc/atlas-admin-api-v2.json
 
 Source: https://www.mongodb.com/docs/api/doc/atlas-admin-api-v2
-
+Source: https://www.mongodb.com/docs/api/doc/atlas-admin-api-v1
 
 ## Instance Sizes
 

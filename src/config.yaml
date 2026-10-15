@@ -12,9 +12,16 @@
 
 # ---- extraction window defaults -------------------------------------------
 extraction:
-  default_days: 7
+  default_days: 7 # max is 70 days
   default_hours: null
   minute_granularity_hours: 36
+  # Disk-partition metrics are fetched over a longer window because Atlas
+  # resets the per-partition series under a new device name on fleet
+  # maintenances (upgrades, resizes). A wider fetch increases the chance
+  # that the pre-rename series is still joinable under the current
+  # partitionName. Evaluation still uses the host-metric window (default_days)
+  # — we trim at eval time; see src/rightsizing/node_eval.py.
+  disk_days: 60
 
 # ---- cross-cutting verdict knobs (apply to both mongod and Search) --------
 evaluation:

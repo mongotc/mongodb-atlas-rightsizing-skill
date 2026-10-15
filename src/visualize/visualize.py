@@ -17,7 +17,6 @@ Default --out: visualization.html next to the input extraction.json
 """
 
 import argparse
-import functools
 import html
 import json
 import os
@@ -25,58 +24,162 @@ import re
 import sys
 import webbrowser
 
+import plotly.colors
 import plotly.graph_objects as go
 import plotly.io as pio
 
+# Reach the shared src/ modules (atlas_tier_spec, constants.*). Append rather
+# than insert so an unrelated top-level `common` doesn't shadow the extraction
+# package when both are on sys.path.
+_SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC_DIR not in sys.path:
+    sys.path.append(_SRC_DIR)
 
-# Tier catalogs live under src/constants/.
-_CONSTANTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "constants"
-)
+from atlas_tier_spec import load_tier_spec  # noqa: E402
+from common.series import Series  # noqa: E402
+from common.system_memory_metrics import SystemMemoryMetrics  # noqa: E402
+from constants.atlas_mongo_metrics import ALL_METRICS as _MONGO_METRICS  # noqa: E402
+from constants.atlas_mongos_metrics import ALL_METRICS as _MONGOS_METRICS  # noqa: E402
+from constants.atlas_search_metrics import ALL_METRICS as _SEARCH_METRICS  # noqa: E402
 
-# extraction config.regions[].provider (Atlas Admin API enum) -> keys used in
-# the two tier catalogs. GCP = "google_cloud" in atlas_dedicated_tier_specs
-# but "gcp" in the flat per-provider file name.
-_PROVIDER_ALIASES = {
-    "AWS":   {"file": "aws",   "catalog": "aws"},
-    "GCP":   {"file": "gcp",   "catalog": "google_cloud"},
-    "AZURE": {"file": "azure", "catalog": "azure"},
+
+# ---------------------------------------------------------------------------
+# Metric → unit resolution
+# ---------------------------------------------------------------------------
+#
+# The authoritative per-metric unit map comes from constants/atlas_*_metrics.py
+# (verified against live Atlas responses — see the comment at the top of
+# atlas_mongo_metrics.py). The visualizer only needs:
+#   - a y-axis display label ("%", "bytes", "ms", ...)
+#   - a raw-to-bytes multiplier for byte-family units (so KB/MB-reported
+#     metrics get normalized before _scale_bytes_unit picks GB/TB)
+# so we translate the Atlas DataMetricUnits enum through two lookup tables
+# rather than carrying the full name through the render pipeline.
+
+# Atlas emits mongod, mongos, and FTS/search metrics across three endpoints.
+# Merge their unit maps so one lookup covers every metric the extractor can
+# produce. Last-wins is fine because the overlapping metric names (CONNECTIONS,
+# SYSTEM_*, etc.) carry the same units in every catalog.
+_ATLAS_METRIC_UNITS = {**_MONGO_METRICS, **_MONGOS_METRICS, **_SEARCH_METRICS}
+
+_ATLAS_UNIT_TO_DISPLAY = {
+    "PERCENT":              "%",
+    "SCALAR":               "count",
+    "SCALAR_PER_SECOND":    "/sec",
+    "MILLISECONDS":         "ms",
+    "BYTES":                "bytes",
+    "KILOBYTES":            "bytes",
+    "MEGABYTES":            "bytes",
+    "GIGABYTES":            "bytes",
+    "BYTES_PER_SECOND":     "bytes/sec",
+    "KILOBYTES_PER_SECOND": "bytes/sec",
+    "MEGABYTES_PER_SECOND": "bytes/sec",
 }
 
+_ATLAS_UNIT_TO_BYTES = {
+    "BYTES":                1,
+    "KILOBYTES":            1024,
+    "MEGABYTES":            1024 ** 2,
+    "GIGABYTES":            1024 ** 3,
+    "BYTES_PER_SECOND":     1,
+    "KILOBYTES_PER_SECOND": 1024,
+    "MEGABYTES_PER_SECOND": 1024 ** 2,
+}
 
-# ---------------------------------------------------------------------------
-# Metric unit labels (y-axis titles). Not tunable, so inline is fine; migrate
-# to src/constants/metrics.py if other callers start needing them.
-# ---------------------------------------------------------------------------
-
+# Fallback patterns for derived / local-only metrics the Atlas catalog
+# doesn't know about (currently just the MEMORY_USED_PERCENTAGE series
+# synthesized by _synthesize_memory_percent via SystemMemoryMetrics).
 _UNIT_PATTERNS = [
-    (re.compile(r"^SYSTEM_NORMALIZED_CPU_"), "%"),
-    (re.compile(r"^SYSTEM_MEMORY_"), "bytes"),
-    (re.compile(r"^SYSTEM_NETWORK_"), "bytes/sec"),
-    (re.compile(r"^CACHE_BYTES_"), "bytes/sec"),
-    (re.compile(r"^DISK_PARTITION_IOPS_"), "ops/sec"),
-    (re.compile(r"^DISK_PARTITION_LATENCY_"), "ms"),
-    (re.compile(r"^DISK_PARTITION_THROUGHPUT_"), "bytes/sec"),
-    (re.compile(r"^DISK_PARTITION_SPACE_PERCENT_USED$"), "%"),
-    (re.compile(r"^DISK_PARTITION_SPACE_(USED|FREE)$"), "bytes"),
-    (re.compile(r"^OP_EXECUTION_TIME_"), "ms"),
-    (re.compile(r"^EXTRA_INFO_PAGE_FAULTS$"), "/sec"),
-    (re.compile(r"_FILL_RATIO$"), "%"),
-    (re.compile(r"^CACHE_PRESSURE_PERCENTAGE$"), "%"),
-    (re.compile(r"^GLOBAL_LOCK_CURRENT_QUEUE_"), "count"),
-    (re.compile(r"^TICKETS_AVAILABLE_"), "count"),
-    (re.compile(r"^CONNECTIONS$"), "count"),
-    (re.compile(r"^FTS_PROCESS_(NORMALIZED_)?CPU_"), "%"),
-    (re.compile(r"^FTS_PROCESS_.*MEMORY$"), "bytes"),
-    (re.compile(r"^FTS_DISK_USAGE$"), "bytes"),
+    (re.compile(r"^MEMORY_USED_PERCENTAGE$"), "%"),
+    (re.compile(r"^MEMORY_USED_BYTES$"),      "bytes"),
 ]
 
 
 def _unit_for(metric_name):
+    """Y-axis label. Consults the authoritative atlas_*_metrics unit catalog
+    first; falls back to the local _UNIT_PATTERNS for synthesized metrics
+    that aren't in the catalog. Unknown metrics render without a label."""
+    atlas_unit = _ATLAS_METRIC_UNITS.get(metric_name)
+    if atlas_unit:
+        return _ATLAS_UNIT_TO_DISPLAY.get(atlas_unit, "")
     for pattern, unit in _UNIT_PATTERNS:
         if pattern.search(metric_name):
             return unit
     return ""
+
+
+def _raw_to_bytes(metric_name):
+    """Multiplier that converts the raw API value to canonical bytes.
+    Returns 1 for non-byte metrics or for anything the Atlas catalog
+    doesn't know, so the raw value passes through unchanged."""
+    atlas_unit = _ATLAS_METRIC_UNITS.get(metric_name)
+    return _ATLAS_UNIT_TO_BYTES.get(atlas_unit, 1)
+
+
+_BYTE_UNITS = {"bytes", "bytes/sec"}
+_BYTE_SCALES = (
+    (1024 ** 4, "TB"),
+    (1024 ** 3, "GB"),
+    (1024 ** 2, "MB"),
+    (1024,      "KB"),
+)
+
+# Fixed palette so each trace's horizontal p5/p50/p95 overlay (see
+# `_STATS_OVERLAY_METRICS` + stats loop in `_metric_figure`) can match the
+# trace's own color — Plotly's auto color cycle would otherwise assign the
+# overlay lines colors from later in the cycle, breaking the visual link.
+_PALETTE = plotly.colors.qualitative.Plotly
+
+# Metrics that get a per-trace horizontal p5/p50/p95 overlay. Scoped
+# narrowly today (just MEMORY_USED_PERCENTAGE — the chart the evaluator's
+# memory trigger reasons about) because overlays double or quadruple
+# trace count and would clutter charts where percentiles aren't the main
+# question.
+_STATS_OVERLAY_METRICS = frozenset({"MEMORY_USED_PERCENTAGE"})
+
+# Human-friendly chart titles for metrics whose SCREAMING_SNAKE_CASE API
+# name would read as noise in the UI. The raw API name stays as the dict
+# key everywhere (host dicts, priority map, _STATS_OVERLAY_METRICS,
+# data-metric attributes in JS); this map only overrides what the viewer
+# sees in the chart title and the right-side chart-visibility panel.
+_METRIC_DISPLAY_NAMES = {
+    "MEMORY_USED_PERCENTAGE": "Memory Used %",
+    "MEMORY_USED_BYTES":      "Memory Used",
+}
+
+
+def _display_name(metric_name):
+    return _METRIC_DISPLAY_NAMES.get(metric_name, metric_name)
+
+
+def _scale_bytes_unit(traces, unit, extra_max=None):
+    """For bytes-based y-axes, pick a scale factor and matching label from
+    the figure's max value so a 5 GB memory series renders as 5 instead of
+    5e9. Scale is 1024-based (binary); non-bytes units pass through
+    unchanged. Returns (scale, display_label); callers divide every y by
+    `scale`.
+
+    `extra_max` lets a caller force the scale to accommodate a value
+    above the data's own max — e.g. a tier memory ceiling at 16 GiB when
+    the actual series tops out at 10 GiB. Without it the scale would be
+    picked from data alone, and the ceiling line (or y-axis range) would
+    land in a different unit than the data."""
+    if unit not in _BYTE_UNITS:
+        return 1, unit
+    max_val = extra_max or 0
+    for _, series in traces:
+        if not series:
+            continue
+        for _, v in series:
+            if v is not None and v > max_val:
+                max_val = v
+    if max_val < 1024:
+        return 1, unit
+    suffix = "/sec" if unit == "bytes/sec" else ""
+    for threshold, label in _BYTE_SCALES:
+        if max_val >= threshold:
+            return threshold, f"{label}{suffix}"
+    return 1, unit
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +204,36 @@ def _trace_label(base, role):
     `buildkite-runner-shard-00-00:27017 (PRIMARY)`."""
     short = _short_role(role)
     return f"{base} ({short})" if short else base
+
+
+def _synthesize_memory_series(entries, total_memory_gb):
+    """Attach two derived host series per entry, both via SystemMemoryMetrics:
+      - MEMORY_USED_PERCENTAGE: 100 * used / tier_ceiling
+      - MEMORY_USED_BYTES:      the raw used series, normalized to bytes via
+                                Series.as_bytes() (so KB → B happens in one
+                                place, not sprinkled through the viewer).
+    Mutates entries in place; idempotent. Silent when the tier ceiling is
+    unknown or SYSTEM_MEMORY_USED is missing — the raw hidden metrics
+    would then show nothing and the derived charts just omit the trace."""
+    if not total_memory_gb or total_memory_gb <= 0:
+        return
+    for _, data in entries:
+        host = data.get("host") or {}
+        if "MEMORY_USED_PERCENTAGE" in host and "MEMORY_USED_BYTES" in host:
+            continue
+        if not host.get("SYSTEM_MEMORY_USED"):
+            continue
+        try:
+            mem = SystemMemoryMetrics.create_from_json(
+                host_json=host, total_memory_gb=total_memory_gb,
+            )
+        except ValueError:
+            continue
+        if mem.used_percentage.points:
+            host["MEMORY_USED_PERCENTAGE"] = list(mem.used_percentage.points)
+        if mem.used.points:
+            host["MEMORY_USED_BYTES"] = list(mem.used.points)
+        data["host"] = host
 
 
 def _collect_mongod_sections(extraction):
@@ -186,37 +319,131 @@ def _series_to_xy(series):
     return xs, ys
 
 
-def _metric_figure(metric_name, traces, include_empty=False):
+#: Bytes per gibibyte — used to turn tier memory_gb into a y-axis ceiling
+#: in canonical bytes. 1024**3 (binary) matches _BYTE_SCALES so the ceiling
+#: lands at a round "16 GB" tick on a 16 GiB tier.
+_BYTES_PER_GB = 1024 ** 3
+
+
+def _metric_figure(metric_name, traces, include_empty=False, total_memory_gb=None):
     """One go.Figure. `traces` = list of (label, series). Empty series are
     skipped by default; pass include_empty=True to still add a labeled trace
     (useful for sections where "no data" is itself the signal — e.g. FTS on
-    mongod when dedicated Search Nodes handle all queries)."""
+    mongod when dedicated Search Nodes handle all queries).
+
+    Bytes-based y-axes are auto-scaled per figure to KB/MB/GB/TB based on
+    the figure's max value (see _scale_bytes_unit) so a 5 GiB memory
+    series reads as `5` instead of `5e9`. A per-metric pre-multiplier
+    (via _raw_to_bytes, driven by the atlas_*_metrics unit catalog)
+    normalizes raw-API values that aren't actually bytes (SYSTEM_MEMORY_*
+    is KILOBYTES, MEMORY_RESIDENT/VIRTUAL/MAPPED is MEGABYTES, etc.) to
+    canonical bytes before auto-scaling runs.
+
+    `total_memory_gb` is the tier's physical memory ceiling, used only
+    for the memory charts: it caps the y-axis at the ceiling for
+    MEMORY_USED_BYTES (so headroom is visible at a glance) and
+    participates in scale selection so a 16 GiB ceiling on 10 GiB data
+    still picks GB. MEMORY_USED_PERCENTAGE caps at 100 regardless. Pass
+    None for metrics that don't want a tier-aware ceiling (all non-memory
+    metrics; also memory charts in sections where the tier didn't
+    resolve)."""
     fig = go.Figure()
-    for label, series in traces:
+    unit = _unit_for(metric_name)
+    pre_mul = _raw_to_bytes(metric_name) if unit in _BYTE_UNITS else 1
+    if pre_mul != 1:
+        traces = [
+            (label, [(ts, v * pre_mul if v is not None else None)
+                     for ts, v in (series or [])])
+            for label, series in traces
+        ]
+    # Ceiling in canonical bytes; only applied to the memory-bytes chart.
+    ceiling_bytes = (
+        total_memory_gb * _BYTES_PER_GB
+        if total_memory_gb and metric_name == "MEMORY_USED_BYTES"
+        else None
+    )
+    scale, unit = _scale_bytes_unit(traces=traces, unit=unit, extra_max=ceiling_bytes)
+    show_stats = metric_name in _STATS_OVERLAY_METRICS
+    # Precompute x-range once so each stat overlay spans the full chart
+    # width even if an individual trace covers a shorter sub-window.
+    if show_stats:
+        all_ts = [p[0] for _, s in traces for p in (s or [])]
+        x_bounds = [min(all_ts), max(all_ts)] if all_ts else None
+    else:
+        x_bounds = None
+    for i, (label, series) in enumerate(traces):
+        color = _PALETTE[i % len(_PALETTE)]
         xs, ys = _series_to_xy(series)
+        if scale != 1:
+            ys = [v / scale if v is not None else None for v in ys]
         if not xs:
             if include_empty:
-                fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name=label))
+                fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name=label,
+                                         line={"color": color}, legendgroup=label))
             continue
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=label))
-    unit = _unit_for(metric_name)
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=label,
+                                 line={"color": color}, legendgroup=label))
+        if show_stats and x_bounds:
+            # Route through Series.stats() so the chart's percentile labels
+            # come from the same code path the evaluator uses (DescriptiveStats
+            # — p5/p50/p95/min/max/n). Wrap the already-scaled points so the
+            # horizontal line hits the same y-axis the trace sits on.
+            stats = Series.from_raw(name=metric_name, raw=list(zip(xs, ys))).stats()
+            if stats is None:
+                continue
+            for stat_name, stat_val, dash in (
+                ("p5",  stats.p5,  "dot"),
+                ("p50", stats.p50, "dashdot"),
+                ("p95", stats.p95, "dash"),
+            ):
+                fig.add_trace(go.Scatter(
+                    x=x_bounds, y=[stat_val, stat_val],
+                    mode="lines",
+                    name=f"{label} {stat_name}={stat_val:g}",
+                    line={"color": color, "dash": dash, "width": 1},
+                    legendgroup=label,
+                    showlegend=True,
+                    hoverinfo="name",
+                ))
     # Default layout = stacked view: legend on the right so long hostnames
     # don't overlap the time axis. The grid-view toggle swaps to a bottom
     # legend via Plotly.relayout (see view-toggle JS in the HTML template)
     # because grid cells are too narrow for a right-side legend.
     fig.update_layout(
-        title=metric_name,
+        title=_display_name(metric_name),
         xaxis_title="time",
         yaxis_title=unit or None,
         height=380,
         margin={"l": 60, "r": 20, "t": 50, "b": 50},
         legend={"orientation": "v", "yanchor": "top", "y": 1, "xanchor": "left", "x": 1.02},
     )
+    # Lock the y-axis top to the tier memory ceiling / 100% so headroom
+    # is obvious. Applied after update_layout so update_yaxes wins.
+    if ceiling_bytes is not None:
+        fig.update_yaxes(range=[0, ceiling_bytes / scale])
+    elif metric_name == "MEMORY_USED_PERCENTAGE":
+        fig.update_yaxes(range=[0, 100])
     return fig
 
 
+#: Raw system-memory series the user explicitly asked us to hide — the
+#: derived MEMORY_USED_PERCENTAGE chart (computed by SystemMemoryMetrics
+#: against the physical tier ceiling) tells the whole story and the raw
+#: bytes series would clutter the memory group. If you need to inspect
+#: the raw signals ad-hoc, drop a name from this set.
+_HIDDEN_HOST_METRICS = frozenset({
+    "SYSTEM_MEMORY_USED",
+    "SYSTEM_MEMORY_FREE",
+    "SYSTEM_MEMORY_AVAILABLE",
+    "SYSTEM_MEMORY_BUFFERS",
+    "SYSTEM_MEMORY_CACHED",
+    "SYSTEM_MEMORY_SHARED",
+})
+
+
 def _collect_metric_names(entries, scope):
-    """Union of metric names across entries. `scope` is "host" or a partition name
+    """Union of metric names across entries, with `_HIDDEN_HOST_METRICS`
+    filtered out when scope=="host". `scope` is "host" or a partition name
     under "disks"."""
     names = set()
     for _, data in entries:
@@ -224,11 +451,16 @@ def _collect_metric_names(entries, scope):
             names.update((data.get("host") or {}).keys())
         else:
             names.update(((data.get("disks") or {}).get(scope) or {}).keys())
+    if scope == "host":
+        names -= _HIDDEN_HOST_METRICS
     # Preserve a stable, roughly-grouped order.
     priority = {
+        # Memory first — the user wants these at the top of each host section
+        # both on the page and in the right-side chart-visibility panel
+        # (which mirrors page order).
+        "MEMORY_USED_PERCENTAGE": -2, "MEMORY_USED_BYTES": -1,
         "SYSTEM_NORMALIZED_CPU_USER": 0, "SYSTEM_NORMALIZED_CPU_KERNEL": 1,
         "SYSTEM_NORMALIZED_CPU_IOWAIT": 2,
-        "SYSTEM_MEMORY_USED": 10, "SYSTEM_MEMORY_FREE": 11,
         "CONNECTIONS": 20,
         "GLOBAL_LOCK_CURRENT_QUEUE_READERS": 30, "GLOBAL_LOCK_CURRENT_QUEUE_WRITERS": 31,
         "TICKETS_AVAILABLE_READS": 32, "TICKETS_AVAILABLE_WRITE": 33,
@@ -247,11 +479,15 @@ def _collect_metric_names(entries, scope):
     return sorted(names, key=lambda n: (priority.get(n, 999), n))
 
 
-def _section_figures(entries, scope, include_empty=False):
+def _section_figures(entries, scope, include_empty=False, total_memory_gb=None):
     """Build one figure per metric in `entries`. Returns [(metric_name, fig), ...].
     When include_empty=True, metrics with no data in any node still render
     (empty chart + legend of nodes), useful for the FTS section where the
-    absence of data is itself what the user wants to see."""
+    absence of data is itself what the user wants to see.
+
+    `total_memory_gb` is forwarded to `_metric_figure` so the memory
+    charts (MEMORY_USED_BYTES, MEMORY_USED_PERCENTAGE) can lock their
+    y-axis top to the tier ceiling."""
     out = []
     for metric in _collect_metric_names(entries=entries, scope=scope):
         traces = []
@@ -261,7 +497,9 @@ def _section_figures(entries, scope, include_empty=False):
             else:
                 series = ((data.get("disks") or {}).get(scope) or {}).get(metric)
             traces.append((label, series))
-        fig = _metric_figure(metric_name=metric, traces=traces, include_empty=include_empty)
+        fig = _metric_figure(metric_name=metric, traces=traces,
+                             include_empty=include_empty,
+                             total_memory_gb=total_memory_gb)
         if fig.data or include_empty:
             out.append((metric, fig))
     return out
@@ -275,95 +513,116 @@ def _disk_partitions(entries):
     return sorted(parts)
 
 
+def _earliest_host_timestamp(extraction):
+    """Earliest ISO-8601 timestamp across every host-metric series in the
+    extraction. ISO Zulu strings sort lexically — no parsing needed."""
+    best = None
+    def check(host):
+        nonlocal best
+        for s in (host or {}).values():
+            if not s:
+                continue
+            t = s[0][0]
+            if best is None or t < best:
+                best = t
+    for node in extraction.get("nodes") or []:
+        check((node.get("data") or {}).get("host"))
+    for shard in (extraction.get("shards") or {}).values():
+        for node in shard:
+            check((node.get("data") or {}).get("host"))
+    for router in extraction.get("routers") or []:
+        check((router.get("data") or {}).get("host"))
+    return best
+
+
+def _trim_disks_in_place(extraction, start):
+    """Trim disk-partition series in-place to points at/after `start`.
+
+    Disks are extracted over a wider window (extraction.disk_days, default
+    60) than host metrics (default 7). Trimming here aligns the x-axis of
+    disk charts with host charts so the viewer sees the same 7-day slice
+    the evaluator uses, instead of 60 days of disk against 7 of host."""
+    if not start:
+        return
+    def trim(nodes):
+        for n in nodes:
+            disks = (n.get("data") or {}).get("disks") or {}
+            for metrics in disks.values():
+                for metric, series in list(metrics.items()):
+                    metrics[metric] = [p for p in (series or []) if p[0] >= start]
+    trim(extraction.get("nodes") or [])
+    for shard in (extraction.get("shards") or {}).values():
+        trim(shard)
+    trim(extraction.get("routers") or [])
+
+
 # ---------------------------------------------------------------------------
-# Tier spec resolution
+# Tier spec resolution — delegates to the shared atlas_tier_spec module so
+# the viz, extractor, and evaluator all read the same catalog.
 # ---------------------------------------------------------------------------
 
-@functools.lru_cache(maxsize=None)
-def _load_flat_tiers(provider_key):
-    """Load src/constants/{provider_key}_tiers.json or return None if absent.
-    `provider_key` is 'aws' | 'gcp' | 'azure'."""
-    path = os.path.join(_CONSTANTS_DIR, f"{provider_key}_tiers.json")
-    if not os.path.exists(path):
+def _resolve_tier_spec(provider, instance_size, generation, cls):
+    """Load the TierSpec for one region via the shared atlas_tier_spec
+    module (which drives extract.py's _resolve_tier_specs). Returns a plain
+    dict so the _fmt_* helpers that render the hardware panel don't need to
+    know about the dataclass. Empty dict on lookup failure — the hardware
+    panel will render '-' in the affected columns."""
+    try:
+        spec = load_tier_spec(
+            provider=provider,
+            instance_size=instance_size,
+            generation=generation,
+            cls=cls,
+        )
+    except (LookupError, FileNotFoundError):
+        return {}
+    return {
+        "vcpus":                    spec.vcpus,
+        "memory_gb":                spec.memory_gb,
+        "storage_min_gb":           spec.storage_min_gb,
+        "storage_max_gb":           spec.storage_max_gb,
+        "extended_storage_max_gb":  spec.extended_storage_max_gb,
+        "disk_iops_min":            spec.disk_iops_min,
+        "disk_iops_max":            spec.disk_iops_max,
+        "max_disk_iops":            spec.max_disk_iops,
+        "max_connections_per_node": spec.max_connections_per_node,
+        "network_performance":      spec.network_performance,
+    }
+
+
+def _primary_region_memory_gb(extraction):
+    """Physical memory ceiling (GB) for the mongod sections, from
+    `config.regions[0]`. For heterogeneous shard-tier clusters we'd need
+    per-node attribution; today the extraction config doesn't carry that,
+    so the common homogeneous case wins and multi-tier clusters eat a
+    small inaccuracy on the used% chart. Returns None when the lookup
+    fails — the synthesizer no-ops in that case."""
+    regions = ((extraction.get("config") or {}).get("regions") or [])
+    if not regions:
         return None
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    r = regions[0]
+    spec = _resolve_tier_spec(
+        provider=r.get("provider"), instance_size=r.get("instance_size"),
+        generation=r.get("generation"), cls=r.get("class"),
+    )
+    return spec.get("memory_gb")
 
 
-@functools.lru_cache(maxsize=None)
-def _load_dedicated_specs():
-    path = os.path.join(_CONSTANTS_DIR, "atlas_dedicated_tier_specs.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _find_flat_row(flat, instance_size):
-    """Look up a flat per-provider file row by hardware_spec_instance_size.
-    Walks nested rows (gcp_tiers.json still has an M30 nested parent)."""
-    if not flat:
-        return None
-    for row in flat.get("tiers", []):
-        if row.get("hardware_spec_instance_size") == instance_size:
-            return row
-        for child in row.get("tiers", []) or []:
-            if child.get("hardware_spec_instance_size") == instance_size:
-                return child
-    return None
-
-
-def _find_catalog_row(catalog_key, base_tier, cls):
-    """Fallback lookup by (cloud_provider, tier, class) in atlas_dedicated_tier_specs."""
-    specs = _load_dedicated_specs()
+def _search_memory_gb(extraction):
+    """Physical memory ceiling (GB) for dedicated Atlas Search Nodes, from
+    `search.specs[0]`. Search Nodes run on their own tier (often different
+    from the mongod shards), so the mongod memory ceiling would misrepresent
+    their used%. Returns None when there are no dedicated Search Node specs
+    or the lookup fails."""
+    specs = ((extraction.get("search") or {}).get("specs") or [])
     if not specs:
         return None
-    for row in specs.get("tiers", []):
-        if (row.get("cloud_provider") == catalog_key
-                and row.get("tier") == base_tier
-                and row.get("class") == cls):
-            return row
-    return None
-
-
-_SPEC_FIELDS = (
-    "vcpus", "memory_gb", "storage_min_gb", "storage_max_gb",
-    "extended_storage_max_gb", "disk_iops_min", "disk_iops_max",
-    "max_disk_iops", "max_connections_per_node", "network_performance",
-)
-
-
-def _resolve_tier_spec(provider, instance_size, base_tier, cls):
-    """Pulled from the flat per-provider catalog first (generation-aware),
-    with null fields backfilled from atlas_dedicated_tier_specs matched by
-    (cloud_provider, tier, class). Returns an empty dict when neither
-    catalog resolves. `_source` is 'flat' | 'catalog' | 'flat+catalog' | None."""
-    alias = _PROVIDER_ALIASES.get((provider or "").upper())
-    if not alias:
-        return {}
-    flat_row = _find_flat_row(flat=_load_flat_tiers(provider_key=alias["file"]),
-                              instance_size=instance_size)
-    catalog_row = _find_catalog_row(catalog_key=alias["catalog"],
-                                    base_tier=base_tier, cls=cls)
-    if not flat_row and not catalog_row:
-        return {}
-    merged = {}
-    used_catalog = False
-    for field in _SPEC_FIELDS:
-        value = (flat_row or {}).get(field)
-        if value is None and catalog_row is not None:
-            value = catalog_row.get(field)
-            if value is not None:
-                used_catalog = True
-        merged[field] = value
-    if flat_row and used_catalog:
-        source = "flat+catalog"
-    elif flat_row:
-        source = "flat"
-    else:
-        source = "catalog"
-    merged["_source"] = source
-    return merged
+    s = specs[0]
+    spec = _resolve_tier_spec(
+        provider=s.get("cloud_provider"), instance_size=s.get("instance_size"),
+        generation=s.get("generation"), cls=s.get("class"),
+    )
+    return spec.get("memory_gb")
 
 
 def _tier_iops_range(spec):
@@ -698,14 +957,11 @@ def _render_hardware_panel(config):
         )
 
     rows = []
-    saw_fallback = False
     for r in regions:
         spec = _resolve_tier_spec(
             provider=r.get("provider"), instance_size=r.get("instance_size"),
-            base_tier=r.get("base_tier"), cls=r.get("class"),
+            generation=r.get("generation"), cls=r.get("class"),
         )
-        if spec.get("_source") in ("catalog", "flat+catalog"):
-            saw_fallback = True
         bits = []
         if r.get("class"):
             bits.append(r["class"])
@@ -723,12 +979,28 @@ def _render_hardware_panel(config):
         # Prefer per-region disk size; the config-level value is a fallback
         # for older extractions and typically matches region 0 anyway.
         region_size = r.get("disk_size_gb") if r.get("disk_size_gb") is not None else disk_size_gb
+        # Nodes cell: total + breakdown by role when there's more than one
+        # kind. Older extractions (pre-breakdown) just see the total.
+        total = r.get("node_count")
+        parts = []
+        if r.get("electable_count"):
+            parts.append(f"{r['electable_count']} electable")
+        if r.get("read_only_count"):
+            parts.append(f"{r['read_only_count']} read-only")
+        if r.get("analytics_count"):
+            parts.append(f"{r['analytics_count']} analytics")
+        node_cell = _fmt(total)
+        if len(parts) > 1:
+            node_cell += (
+                f'<br><span style="color:#777;font-size:12px">'
+                f'{html.escape(" + ".join(parts))}</span>'
+            )
         rows.append(
             "<tr>"
             f"<td>{html.escape(provider)}</td>"
             f"<td>{html.escape(r.get('region') or '-')}</td>"
             f"<td>{instance_display}</td>"
-            f"<td>{_fmt(r.get('node_count'))}</td>"
+            f"<td>{node_cell}</td>"
             f"<td>{_fmt(spec.get('vcpus'))}</td>"
             f"<td>{html.escape(_fmt_memory(spec))}</td>"
             f"<td>{_fmt_iops_cell(provisioned=r.get('disk_iops'), spec=spec, provider=r.get('provider'), disk_size_gb=region_size)}</td>"
@@ -736,11 +1008,6 @@ def _render_hardware_panel(config):
             f"<td>{_fmt(spec.get('max_connections_per_node'))}</td>"
             "</tr>"
         )
-    footnote = (
-        '<p class="hw-note">Some values backfilled from atlas_dedicated_tier_specs.json '
-        '(generation-agnostic) when the flat per-provider file lacks a '
-        'generation-specific entry.</p>' if saw_fallback else ""
-    )
     return (
         '<h2 id="cluster-hardware">Cluster hardware</h2>'
         '<table class="hw">'
@@ -751,7 +1018,6 @@ def _render_hardware_panel(config):
         "</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
-        f"{footnote}"
     )
 
 
@@ -803,7 +1069,7 @@ def _render_html(extraction, section_figs):
         for metric, fig in figs:
             fragment = pio.to_html(fig, include_plotlyjs=False, full_html=False)
             body_parts.append(
-                f'<div class="fig" data-metric="{html.escape(metric)}">{fragment}</div>'
+                f'<div class="fig" data-metric="{html.escape(_display_name(metric))}">{fragment}</div>'
             )
         body_parts.append('</div>')
 
@@ -824,10 +1090,29 @@ def visualize(extraction_path, out=None, open_browser=True):
     with open(extraction_path, encoding="utf-8") as f:
         extraction = json.load(f)
 
+    # Align disk charts with the host evaluation window. Extractions fetch
+    # disks over `extraction.disk_days` (default 60) but evaluate against
+    # the host window — show the viewer the same slice.
+    _trim_disks_in_place(extraction=extraction,
+                         start=_earliest_host_timestamp(extraction=extraction))
+
+    # Resolve the mongod tier's physical memory ceiling from the extraction
+    # config so SystemMemoryMetrics can compute used% against the real
+    # instance total (not against used+free, which excludes buffers/cache).
+    # Single-tier homogeneous clusters are the common case; mixed-region
+    # or shard-specific tiers aren't attributed per-node in the extraction
+    # today, so we take regions[0] and let heterogeneous clusters eat a
+    # small inaccuracy rather than block the chart entirely.
+    mongod_memory_gb = _primary_region_memory_gb(extraction=extraction)
+    # Dedicated Search Nodes may run on a different tier (search.specs[]).
+    search_memory_gb = _search_memory_gb(extraction=extraction)
+
     sections = []
     # --- mongod sections (replica set, or sharded + routers) ---
     for section_name, entries in _collect_mongod_sections(extraction=extraction).items():
-        host_figs = _section_figures(entries=entries, scope="host")
+        _synthesize_memory_series(entries=entries, total_memory_gb=mongod_memory_gb)
+        host_figs = _section_figures(entries=entries, scope="host",
+                                     total_memory_gb=mongod_memory_gb)
         sections.append((section_name, host_figs))
         for part in _disk_partitions(entries=entries):
             part_figs = _section_figures(entries=entries, scope=part)
@@ -836,7 +1121,9 @@ def visualize(extraction_path, out=None, open_browser=True):
 
     # --- Dedicated Search Node section (orthogonal to mongod shape) ---
     for section_name, entries in _collect_search_sections(search=extraction.get("search") or {}).items():
-        host_figs = _section_figures(entries=entries, scope="host")
+        _synthesize_memory_series(entries=entries, total_memory_gb=search_memory_gb)
+        host_figs = _section_figures(entries=entries, scope="host",
+                                     total_memory_gb=search_memory_gb)
         sections.append((section_name, host_figs))
 
     # --- Free-tier stub: nothing to plot ---

@@ -18,13 +18,15 @@ have a single well-defined interface to dispatch to.
 from common import SHARED_TIERS, summarize_config, tier_info
 
 
-def extract(client, group_id, cluster_cfg, window, processes):
+def extract(client, group_id, cluster_cfg, window, processes, tier_specs=None):
     """Return a not-supported marker for shared/serverless/flex tiers.
 
     The signature matches extract_gen1_data and extract_shard_data so a
     dispatcher can call any of them uniformly. `client`, `group_id`,
-    `window` and `processes` are intentionally unused — no Atlas calls are
-    made because none of the relevant metrics are available.
+    `window`, `processes` and `tier_specs` are intentionally unused — no
+    Atlas calls are made because none of the relevant metrics are
+    available (and shared tiers don't have an entry in the per-provider
+    tier catalogs anyway).
 
     Returns:
         {

@@ -62,8 +62,8 @@ We are basically flagging a node as under-utilized or over-utilized:
 
 | Type | What | Window |	Lookback |	Metric to read|
 | -----|------|--------|-----------|----------------|
-| Over-utilized |	Moments where the resource ran out | Fine: 1 min, or 10 to 60 sec if available | Days | p99 and max
-| Under-utilized |	Sustained headroom you’re paying for |	Coarse: 5 min to 1 hour is fine | 2 to 4 weeks (catch weekly and month-end cycles) | p95, compared to capacity
+| Over-utilized |	Moments where the resource ran out | Fine: 1 min, or 10 to 60 sec | Days | p99 and max
+| Under-utilized |	Sustained headroom you’re paying for |	Coarse: 5 min to 1 hour | Weeks | p95, compared to capacity
 
 normal sits between this
 

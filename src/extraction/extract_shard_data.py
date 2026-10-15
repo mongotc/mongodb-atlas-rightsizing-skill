@@ -33,33 +33,7 @@ from constants.atlas_mongos_metrics import ALL_METRICS as _MONGOS_METRICS
 MONGOS_HOST_METRICS = list(_MONGOS_METRICS.keys())
 
 
-def extract(client, group_id, cluster_cfg, window, processes):
-    """Return raw metrics grouped by replica set (shards + config server) plus
-    a separate list for the mongos routers.
-
-    Args:
-        client:       AtlasClient
-        group_id:     Atlas project (group) ID.
-        cluster_cfg:  Cluster config dict (from GET /groups/{gid}/clusters/{name}).
-        window:       {"granularity": "PT1H", "period": "P7D", ...}
-        processes:    All processes for the project (from GET /groups/{gid}/processes).
-
-    Returns:
-        {
-          "type": "sharded",
-          "cluster": <cluster name>,
-          "config": {"cluster_type": ..., "tiers": [...], "provisioned_iops": [...],
-                     "autoscaling": {...}, "tier_notes": [...]},
-          "shards": {
-             "<replica_set_name>": [<node>, ...],   # one entry per shard AND
-             ...                                    # one entry for the config RS
-          },
-          "routers": [<node>, ...],   # mongos routers; may be empty
-        }
-    Each <node> has the same shape as in extract_gen1_data:
-      {"label", "role", "hosts", "data": {"host", "disks"}}. Router entries
-      have data["disks"] == {} because they don't have local storage.
-    """
+def extract(client, group_id, cluster_cfg, window, processes, tier_specs=None):    
     host_keys = cluster_host_keys(cluster_cfg=cluster_cfg)
     cluster_name = cluster_cfg.get("name", "")
     cluster_procs = [p for p in processes

@@ -32,7 +32,8 @@ def evaluate(extraction, thresholds, window):
             "current_tier": tier,
             "cluster_type": (extraction.get("config") or {}).get("cluster_type"),
             "verdict": "no_change", "confidence": "n/a",
-            "triggers": [], "borderline": [], "notes": [], "coverage": None, "nodes": [],
+            "triggers": [], "borderline": [], "notes": [], "coverage": None,
+            "compute_coverage": None, "disk_coverage": None, "nodes": [],
             "reasons": [extraction.get("reason") or
                         f"Shared/free tier {tier} — doesn't expose the hardware "
                         f"measurements the rightsizing thresholds depend on."],
@@ -42,7 +43,8 @@ def evaluate(extraction, thresholds, window):
             "cluster_name": cluster_name, "cluster": cluster_name,
             "current_tier": "UNKNOWN", "cluster_type": None,
             "verdict": "error", "confidence": "n/a",
-            "triggers": [], "borderline": [], "notes": [], "coverage": None, "nodes": [],
+            "triggers": [], "borderline": [], "notes": [], "coverage": None,
+            "compute_coverage": None, "disk_coverage": None, "nodes": [],
             "reasons": [f"Unknown extraction type: {t!r}"],
         }]
 
