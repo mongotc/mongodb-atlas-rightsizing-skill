@@ -209,16 +209,29 @@ def primary_region_provisioned_iops(extraction):
 
 def primary_region_provisioned_throughput(extraction):
     """Provisioned disk-throughput ceiling (bytes/sec) for the mongod
-    sections, computed from `config.regions[0]`. Routes through
-    `DiskThroughputMetrics.calc_provisioned_throughput` — AWS today
-    (gp3 base formula + Gen 2 extra-IOPS kicker + io2 PIOPS formula +
-    NVMe constant), with per-tier EC2 bandwidth caps applied. GCP and
-    Azure return None, so their per-node Disk Throughput chart auto-
-    ranges with no ceiling line."""
+    sections, computed from `config.regions[0]` + the per-provider tier
+    catalog. Routes through
+    `DiskThroughputMetrics.calc_provisioned_throughput`:
+
+      - AWS: gp3 base formula + Gen 2 extra-IOPS kicker + io2 PIOPS
+        formula + NVMe constant, with per-tier EC2 bandwidth caps.
+      - GCP: Gen 1 pd-ssd formula `0.48 * disk_size_gb + 240`, capped
+        at the per-vCPU pd-ssd instance limit. Gen 2 (Hyperdisk Balanced)
+        not implemented yet.
+      - Azure: not implemented.
+
+    Returns None when the formula can't be evaluated — the per-node Disk
+    Throughput chart then auto-ranges with no ceiling line."""
     regions = ((extraction.get("config") or {}).get("regions") or [])
     if not regions:
         return None
     r = regions[0]
+    # vCPU count feeds the GCP pd-ssd per-instance cap and comes from the
+    # tier catalog (AWS branches ignore the kwarg).
+    spec = resolve_tier_spec(
+        provider=r.get("provider"), instance_size=r.get("instance_size"),
+        generation=r.get("generation"), cls=r.get("class"),
+    )
     return DiskThroughputMetrics.calc_provisioned_throughput(
         provider=r.get("provider"),
         generation=r.get("generation"),
@@ -227,6 +240,7 @@ def primary_region_provisioned_throughput(extraction):
         disk_size_gb=r.get("disk_size_gb"),
         provisioned_iops=r.get("disk_iops"),
         tier_class=r.get("class"),
+        vcpus=spec.get("vcpus"),
     )
 
 

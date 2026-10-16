@@ -63,6 +63,26 @@ def _is_nvme_class(cls):
     return "nvme" in (cls or "").lower()
 
 
+def _gcp_pdssd_instance_cap_mib_per_sec(vcpus):
+    """GCP pd-ssd per-instance throughput cap by vCPU count. Values from
+    GCP's N1 / N2 pd-ssd tables (same across E2 / N2D / most of GCP's
+    general-purpose series; machine types with different caps are rare
+    enough that this table is a safe approximation). Returns MiB/s.
+
+    Falls back to the pd-ssd disk-type cap (1,200 MiB/s) when vCPU count
+    isn't known — matches "if a specific size isn't listed, calculate
+    performance using instance_limit" fallback behavior."""
+    if vcpus is None:
+        return 1200
+    if vcpus < 2:
+        return 204
+    if vcpus < 8:
+        return 240
+    if vcpus < 16:
+        return 800
+    return 1200
+
+
 @dataclass(frozen=True)
 class DiskThroughputMetrics:
     """Read / write throughput (bytes per second) for one disk partition.
@@ -130,7 +150,8 @@ class DiskThroughputMetrics:
                                     ebs_volume_type: Optional[str],
                                     disk_size_gb: Optional[float],
                                     provisioned_iops: Optional[int] = None,
-                                    tier_class: Optional[str] = None) -> Optional[int]:
+                                    tier_class: Optional[str] = None,
+                                    vcpus: Optional[int] = None) -> Optional[int]:
         '''
         Return the provisioned disk-throughput ceiling in BYTES_PER_SECOND,
         or None when the (provider, tier, volume type) combo isn't modelled.
@@ -160,10 +181,36 @@ class DiskThroughputMetrics:
 
         EC2 instance caps come from `_EC2_THROUGHPUT_CAP_BYTES`; tiers not
         in that table skip the cap step (formula value alone is returned).
+
+        GCP formulas (per GCP's "Persistent Disk performance" doc):
+
+          - Gen 1 / pd-ssd (M10/M20 and M30+ without _GEN_2):
+              formula_mib  = 0.48 * disk_size_gb + 240
+              instance_cap = per-vCPU bucket from the pd-ssd machine-type
+                             table (2-7 vCPUs → 240, 8-15 → 800, 16+ → 1200)
+              Final = min(formula_mib, instance_cap).
+
+          - Gen 2 / Hyperdisk Balanced (M30+ _GEN_2): not implemented —
+            Hyperdisk uses a different (configurable) model whose
+            per-tier caps aren't captured here yet. Returns None.
         '''
-        if (provider or "").upper() != "AWS":
-            return None
         if disk_size_gb is None:
+            return None
+
+        provider_u = (provider or "").upper()
+
+        if provider_u == "GCP":
+            # Gen 2 is Hyperdisk Balanced — different formula family;
+            # deferred until Atlas-side tier mapping is captured.
+            if (generation or "").lower() == "gen2":
+                return None
+            # Gen 1 pd-ssd baseline + per-GiB rate, capped by the pd-ssd
+            # per-instance limit (which varies by vCPU count).
+            formula_mib = 0.48 * disk_size_gb + 240
+            instance_cap_mib = _gcp_pdssd_instance_cap_mib_per_sec(vcpus=vcpus)
+            return int(min(formula_mib, instance_cap_mib) * _MIB_PER_SEC)
+
+        if provider_u != "AWS":
             return None
 
         # NVMe tiers short-circuit — constant cap, no formula.
