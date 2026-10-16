@@ -151,3 +151,90 @@ def load_tier_spec(provider: str, instance_size: str,
         network_performance=row.get("network_performance"),
         available=bool(row.get("available", True)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Search Node tier catalog
+# ---------------------------------------------------------------------------
+#
+# Backs atlas_{aws,gcp,azure}_search_tier_spec.json. Row shape:
+#   {
+#     "hardware_spec_instance_size": "S50_HIGHCPU_NVME",
+#     "tier": "S50",
+#     "available": true,
+#     "class": "high_cpu_nvme",
+#     "vcpus": 16,
+#     "memory_gb": 32,
+#     "storage_gb": 674,                 # single value, not a range
+#     "disk_iops_read": 680000,
+#     "disk_iops_write": 360000,
+#     "network_performance": "very_high",
+#     "regions": []
+#   }
+#
+# Why a separate dataclass + loader (vs. extending TierSpec / load_tier_spec):
+#   - Mongod rows match by `tier` ("M40"); Search rows match by
+#     `hardware_spec_instance_size` ("S50_HIGHCPU_NVME") because Search's
+#     `tier` collides across HIGHCPU / LOWCPU / STORAGE variants.
+#   - Schema is narrower (no generation, storage ranges, max connections).
+#   - Keeping them separate makes each lookup rule legible.
+
+
+@dataclass(frozen=True)
+class SearchTierSpec:
+    """One row of Atlas dedicated Search Node hardware specs."""
+    provider: str                           # "AWS" | "GCP" | "AZURE"
+    instance_size: str                      # e.g. "S50_HIGHCPU_NVME"
+    tier: str                               # e.g. "S50"
+    cls: Optional[str]                      # e.g. "high_cpu_nvme"
+    vcpus: Optional[float]
+    memory_gb: Optional[float]
+    storage_gb: Optional[float]
+    disk_iops_read: Optional[int]
+    disk_iops_write: Optional[int]
+    network_performance: Optional[str]
+    available: bool
+
+
+@lru_cache(maxsize=None)
+def _load_search_catalog(provider: str) -> dict:
+    """Load and cache the per-provider Search tier spec JSON. Raises
+    FileNotFoundError if the provider isn't recognized or the catalog file
+    is missing (today only GCP ships; AWS/AZURE will raise until added)."""
+    key = _PROVIDER_TO_FILE.get((provider or "").upper())
+    if not key:
+        raise FileNotFoundError(
+            f"No Search tier spec catalog for provider {provider!r} — "
+            f"known providers: {sorted(_PROVIDER_TO_FILE)}"
+        )
+    path = os.path.join(_CATALOG_DIR, f"atlas_{key}_search_tier_spec.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_search_tier_spec(provider: str, instance_size: str) -> SearchTierSpec:
+    """Resolve the SearchTierSpec matching `(provider, instance_size)` against
+    the per-provider Search catalog. Unlike mongod, Search catalog rows
+    carry no generation/class disambiguator — `hardware_spec_instance_size`
+    (e.g. "S50_HIGHCPU_NVME") is the full key.
+
+    Raises LookupError when no row matches."""
+    catalog = _load_search_catalog(provider=provider)
+    for row in catalog.get("tiers") or []:
+        if row.get("hardware_spec_instance_size") == instance_size:
+            return SearchTierSpec(
+                provider=(provider or "").upper(),
+                instance_size=row.get("hardware_spec_instance_size"),
+                tier=row.get("tier"),
+                cls=row.get("class"),
+                vcpus=row.get("vcpus"),
+                memory_gb=row.get("memory_gb"),
+                storage_gb=row.get("storage_gb"),
+                disk_iops_read=row.get("disk_iops_read"),
+                disk_iops_write=row.get("disk_iops_write"),
+                network_performance=row.get("network_performance"),
+                available=bool(row.get("available", True)),
+            )
+    raise LookupError(
+        f"No Search tier {instance_size!r} in {provider} Search catalog"
+    )

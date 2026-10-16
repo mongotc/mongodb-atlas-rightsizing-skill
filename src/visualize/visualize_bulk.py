@@ -4,8 +4,9 @@ Bulk visualization driven by an extraction summary.
 
 Mirrors src/rightsizing/rightsize_bulk.py: takes the extraction_summary.json
 produced by extract_bulk.py, iterates every cluster that extracted
-successfully, and writes a visualization.html next to each extraction.json.
-Browser auto-open is forced off (bulk runs would spawn 80+ tabs otherwise).
+successfully, and writes BOTH visualization HTMLs (overlay + per-node) next
+to each extraction.json via the top-level orchestrator in `visualize.py`.
+Browser auto-open is forced off (bulk runs would spawn 160+ tabs otherwise).
 
 Example:
 
@@ -53,8 +54,8 @@ def visualize_bulk(summary_path, verbose=True):
             continue
 
         try:
-            out_path = visualize(extraction_path=extraction_path, out=None,
-                                 open_browser=False)
+            old_path, new_path = visualize(extraction_path=extraction_path,
+                                           out=None, open_browser=False)
         except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
             total_errors += 1
             if verbose:
@@ -63,7 +64,7 @@ def visualize_bulk(summary_path, verbose=True):
 
         total_ok += 1
         if verbose:
-            print(f"[ok]   {pname} / {cname}: {out_path}")
+            print(f"[ok]   {pname} / {cname}: {old_path} + {new_path}")
 
     if verbose:
         print(f"\nVisualized {total_ok} cluster(s), "
