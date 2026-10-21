@@ -196,9 +196,17 @@ def generate_bulk_summary_markdown(rows: list[dict]) -> str:
     """Top-level bulk markdown. One row per cluster in `rows`; each row
     carries {cluster, status, mongod, search, ?error} where mongod and
     search are bool|None (True → 'down', False/None → 'n/a'). Rows with
-    status=='err' render both columns as 'err'."""
+    status=='err' render both columns as 'err'. Prepends a totals block
+    with the count of 'down' verdicts per fleet (err rows excluded from
+    the denominator)."""
+    ok_rows = [r for r in rows if r.get("status") != "err"]
+    mongod_down = sum(1 for r in ok_rows if r.get("mongod") is True)
+    search_down = sum(1 for r in ok_rows if r.get("search") is True)
     lines = [
         "# Rightsizing Bulk Summary",
+        "",
+        f"**Mongod can scale down**: {mongod_down} / {len(ok_rows)}  ",
+        f"**Search can scale down**: {search_down} / {len(ok_rows)}",
         "",
         "| Cluster | Mongod | Search |",
         "|---|---|---|",

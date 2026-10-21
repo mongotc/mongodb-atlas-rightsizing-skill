@@ -104,7 +104,7 @@ def load_tier_spec(provider: str, instance_size: str,
     catalog = _load_catalog(provider=provider)
     candidates = [
         row for row in catalog.get("tiers") or []
-        if row.get("tier") == instance_size
+        if row.get("hardware_spec_instance_size") == instance_size
     ]
     if not candidates:
         raise LookupError(

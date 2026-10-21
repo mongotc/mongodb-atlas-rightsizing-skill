@@ -166,8 +166,10 @@ def primary_region_memory_gb(extraction):
         return None
     r = regions[0]
     spec = resolve_tier_spec(
-        provider=r.get("provider"), instance_size=r.get("instance_size"),
-        generation=r.get("generation"), cls=r.get("class"),
+        provider=r.get("provider"), 
+        instance_size=r.get("instance_size"),
+        generation=r.get("generation"), 
+        cls=r.get("class"),
     )
     return spec.get("memory_gb")
 

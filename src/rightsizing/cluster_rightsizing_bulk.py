@@ -17,8 +17,8 @@ After the loop, writes a top-level `rightsizing_bulk_report.md` with a
   - "n/a"  → fleet cannot scale down OR doesn't exist on that cluster
 
 Mirrors src/visualize/visualize_bulk.py's skip-and-continue semantics —
-one bad cluster never stops the run. Exit code 2 if any per-cluster error
-was recorded, else 0.
+one bad cluster never stops the run. Always exits 0; per-cluster errors
+are logged to stderr and rendered as `err | err` rows in the bulk report.
 
 Example:
 
@@ -60,7 +60,8 @@ def cluster_rightsizing_bulk(summary_path: str,
     status=="ok", and for each: rightsize + visualize + record the
     cluster's two scale-down verdicts. Writes
     `rightsizing_bulk_report.md` to `out_dir` (default: summary's own
-    directory). Returns 2 on any per-cluster error, else 0."""
+    directory). Always returns 0; per-cluster failures surface as
+    `err | err` rows in the bulk report and stderr `[err]` lines."""
 
     with open(summary_path, encoding="utf-8") as f:
         summary = json.load(f)
@@ -78,22 +79,22 @@ def cluster_rightsizing_bulk(summary_path: str,
     for item in summary.get("results", []):
         pname = item.get("project") or item.get("project_id") or "unknown"
         cname = item.get("cluster") or "unknown"
-        label = f"{pname} / {cname}"
+        qname = f"{pname}.{cname}"
 
         if item.get("status") != "ok":
             total_skipped += 1
             if verbose:
-                print(f"[skip] {label}: extraction not ok")
+                print(f"[skip] {qname}: extraction not ok")
             continue
 
         extraction_path = item.get("out")
         if not extraction_path or not os.path.exists(extraction_path):
             total_err += 1
-            rows.append({"cluster": cname, "status": "err",
+            rows.append({"cluster": qname, "status": "err",
                          "mongod": None, "search": None,
                          "error": f"extraction file missing: {extraction_path}"})
             if verbose:
-                print(f"[err]  {label}: extraction file missing: "
+                print(f"[err]  {qname}: extraction file missing: "
                       f"{extraction_path}", file=sys.stderr)
             continue
 
@@ -104,14 +105,14 @@ def cluster_rightsizing_bulk(summary_path: str,
             report_path = os.path.join(
                 os.path.dirname(extraction_path), "rightsizing_report.md",
             )
-            write_report(result=result, path=report_path, cluster_name=cname)
+            write_report(result=result, path=report_path, cluster_name=qname)
             visualize(extraction_path=extraction_path, out=None, open_browser=False)
         except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
             total_err += 1
-            rows.append({"cluster": cname, "status": "err",
+            rows.append({"cluster": qname, "status": "err",
                          "mongod": None, "search": None, "error": str(e)})
             if verbose:
-                print(f"[err]  {label}: {e}", file=sys.stderr)
+                print(f"[err]  {qname}: {e}", file=sys.stderr)
             continue
 
         total_ok += 1
@@ -119,13 +120,13 @@ def cluster_rightsizing_bulk(summary_path: str,
             result.search_can_scale_down if result.search_nodes else None
         )
         rows.append({
-            "cluster": cname,
+            "cluster": qname,
             "status": "ok",
             "mongod": result.can_scale_down,
             "search": search_cell,
         })
         if verbose:
-            print(f"[ok]   {label}: mongod={_label(result.can_scale_down)} "
+            print(f"[ok]   {qname}: mongod={_label(result.can_scale_down)} "
                   f"search={_label(search_cell)}")
 
     bulk_report_path = os.path.join(out_dir, "rightsizing_bulk_report.md")
@@ -136,7 +137,7 @@ def cluster_rightsizing_bulk(summary_path: str,
               f"{total_err} error(s), {total_skipped} skipped")
         print(f"[bulk summary written to {bulk_report_path}]", file=sys.stderr)
 
-    return 2 if total_err else 0
+    return 0
 
 
 def console_main(argv: Optional[list[str]] = None) -> int:
