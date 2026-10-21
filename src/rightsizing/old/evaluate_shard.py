@@ -10,8 +10,8 @@ checks are skipped with an explanatory note in that case (handled inside
 `_context` in evaluate_replicaset).
 """
 
-from evaluate_replicaset import _context, evaluate_group
-from autoscaling import autoscaling_notes
+from rightsizing.old.evaluate_replicaset import _context, evaluate_group
+from rightsizing.old.autoscaling import autoscaling_notes
 from stats import summarize
 
 

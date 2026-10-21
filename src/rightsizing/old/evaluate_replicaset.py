@@ -19,8 +19,8 @@ if _SRC_DIR not in sys.path:
 from constants.tiers import SHARED_TIERS, TIER_MAX_CONNECTIONS, normalize_tier  # noqa: E402
 from constants.verdicts import DISK_TRIGGERS  # noqa: E402
 
-from autoscaling import autoscaling_notes  # noqa: E402
-from node_eval import DISK_SPARSE_THRESHOLD, evaluate_node  # noqa: E402
+from rightsizing.old.autoscaling import autoscaling_notes  # noqa: E402
+from rightsizing.old.node_eval import DISK_SPARSE_THRESHOLD, evaluate_node  # noqa: E402
 
 
 def _confidence(verdict, trigger_ids, window_days, compute_coverage, disk_coverage,

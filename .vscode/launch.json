@@ -114,6 +114,32 @@
             ]
         },
         {
+            "name": "Cluster Rightsizing (CPU v1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/rightsizing/cluster_rightsizing.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "args": [
+                "--extraction",
+                "${input:extractionPath}"
+            ]
+        },
+        {
+            "name": "Cluster Rightsizing Bulk",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/rightsizing/cluster_rightsizing_bulk.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "python": "${userHome}/.pyenv/versions/rightsizing/bin/python",
+            "args": [
+                "--summary",
+                "${input:summaryPath}"
+            ]
+        },
+        {
             "name": "Visualize (single cluster)",
             "type": "debugpy",
             "request": "launch",

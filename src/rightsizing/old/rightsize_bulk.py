@@ -19,9 +19,9 @@ import os
 import sys
 from datetime import datetime, timezone
 
-import evaluate as evaluate_mod
-from report import write_report, write_summary
-from rightsize import _window_from_extraction
+import rightsizing.old.evaluate as evaluate_mod
+from rightsizing.old.report import write_report, write_summary
+from rightsizing.old.rightsize import _window_from_extraction
 from thresholds import DEFAULT_YAML_PATH, load_thresholds
 
 

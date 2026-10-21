@@ -1,4 +1,5 @@
 from __future__ import annotations
+import operator
 from dataclasses import dataclass
 from typing import Optional
 from common.series import Series
@@ -65,6 +66,17 @@ class CPUNormalizedMetrics:
     def __bool__(self) -> bool:
         """Truthy when USER has data — the minimum any derivation needs."""
         return bool(self.user)
+
+    # ---- derived series --------------------------------------------------
+
+    def user_plus_kernel(self) -> Series:
+        """USER + KERNEL combined on timestamp. Primary CPU saturation
+        signal — callers read `.stats()` for p5/p50/p95 or iterate `.points`
+        for day-level breach counting."""
+        return self.user.combined(
+            other=self.kernel, fn=operator.add,
+            name="CPU_USER_PLUS_KERNEL", unit="PERCENT",
+        )
 
     # ---- per-window summaries --------------------------------------------
 

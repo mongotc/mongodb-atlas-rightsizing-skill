@@ -10,9 +10,9 @@ src/extraction/extract_search_data.py:32-34), so this dispatcher always runs
 the Search evaluator when `extraction.search.present` and appends its result.
 """
 
-import evaluate_replicaset
-import evaluate_search
-import evaluate_shard
+import rightsizing.old.evaluate_replicaset as evaluate_replicaset
+import rightsizing.old.evaluate_search as evaluate_search
+import rightsizing.old.evaluate_shard as evaluate_shard
 
 
 def evaluate(extraction, thresholds, window):

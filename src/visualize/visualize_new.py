@@ -291,7 +291,11 @@ def _grid_legend_html(trace_names):
 
 def _mongod_cpu_builder(host):
     """Return a list of (chart_title, trace_specs, y_max) for a mongod/mongos
-    host. Builds a single `CPU %` chart with eight normalized traces.
+    host. Builds a single `CPU %` chart with the traces that drive the CPU
+    bottleneck verdict: User, Kernel, their timestamp-aligned sum
+    (User+Kernel — the signal CPURightsizing evaluates against the up/down
+    thresholds), IOWait (disk-bound indicator), and IRQ. Nice / SoftIRQ /
+    Steal / Guest are omitted — low signal for rightsizing on Atlas hosts.
     y_max=100 — these are per-core normalized percentages, so sibling
     tiles share one visual scale and saturation reads at a glance.
     Returns [] if the CPU family is missing (host silently skips its
@@ -303,14 +307,11 @@ def _mongod_cpu_builder(host):
     return [(
         "CPU %",
         [
-            ("User",    cpu.user),
-            ("Kernel",  cpu.kernel),
-            ("IOWait",  cpu.iowait),
-            ("Guest",   cpu.guest),
-            ("IRQ",     cpu.irq),
-            ("Nice",    cpu.nice),
-            ("SoftIRQ", cpu.softirq),
-            ("Steal",   cpu.steal),
+            ("User",          cpu.user),
+            ("Kernel",        cpu.kernel),
+            ("User + Kernel", cpu.user_plus_kernel()),
+            ("IOWait",        cpu.iowait),
+            ("IRQ",           cpu.irq),
         ],
         100,
     )]
@@ -372,13 +373,24 @@ def _mongod_disk_builder(data, iops_cap=None, throughput_cap=None):
         # and the suffix would be noise.
         suffix = f" — {partition}" if len(disks) > 1 else ""
         try:
-            iops = DiskIopsMetrics.create_from_json(partition_json=pj)
+            iops = DiskIopsMetrics.create_from_json(
+                partition_json=pj, provisioned_iops=iops_cap,
+            )
             out.append((
                 f"Disk IOPS{suffix}",
                 [("Read", iops.read), ("Write", iops.write)],
                 iops_cap, "/sec",
                 "Provisioned IOPS" if iops_cap else None,
             ))
+            # Only render the % tile when we actually have a ceiling to
+            # divide by — otherwise used_percentage is an empty series
+            # and the tile would be blank.
+            if iops_cap:
+                out.append((
+                    f"Disk IOPS %{suffix}",
+                    [("Used %", iops.used_percentage)],
+                    100, "%", None,
+                ))
         except ValueError:
             pass
         try:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import operator
 from dataclasses import dataclass
 from typing import Optional
 from common.series import Series
@@ -60,6 +61,17 @@ class SearchCPUNormalizedMetrics:
         """Truthy when the raw USER series has data — the minimum any
         derivation needs."""
         return bool(self.cpu_user)
+
+    # ---- derived series --------------------------------------------------
+
+    def user_plus_kernel(self) -> Series:
+        """Normalized USER + KERNEL combined on timestamp. Primary Search
+        CPU saturation signal — uses the per-core normalized fields so the
+        result is bounded [0, 100] regardless of vCPU count."""
+        return self.normalized_cpu_user.combined(
+            other=self.normalized_cpu_kernel, fn=operator.add,
+            name="SEARCH_CPU_USER_PLUS_KERNEL", unit="PERCENT",
+        )
 
     # ---- per-window summaries --------------------------------------------
 

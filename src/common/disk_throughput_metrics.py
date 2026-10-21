@@ -86,14 +86,24 @@ def _gcp_pdssd_instance_cap_mib_per_sec(vcpus):
 @dataclass(frozen=True)
 class DiskThroughputMetrics:
     """Read / write throughput (bytes per second) for one disk partition.
-    Constructor takes the dict at `data.disks[partition_name]`."""
-    read: Series   # DISK_PARTITION_THROUGHPUT_READ
-    write: Series  # DISK_PARTITION_THROUGHPUT_WRITE
+    Constructor takes the dict at `data.disks[partition_name]`.
+
+    `provisioned_throughput` is the tier-level cap in bytes/sec. When
+    supplied, `used_percentage` is populated as 100 × (read + write) /
+    provisioned — the same pre-computed percentage pattern DiskIopsMetrics
+    uses. When provisioned is None (unresolvable provider / tier),
+    `used_percentage` is an empty PERCENT Series and the evaluator emits
+    a no-data verdict upstream."""
+    read: Series                            # DISK_PARTITION_THROUGHPUT_READ
+    write: Series                           # DISK_PARTITION_THROUGHPUT_WRITE
+    provisioned_throughput: Optional[int]   # tier-level ceiling, bytes/sec
+    used_percentage: Series                 # 100 × (read + write) / provisioned
 
     # ---- parsers ---------------------------------------------------------
 
     @classmethod
-    def create_from_json(cls, partition_json: dict) -> "DiskThroughputMetrics":
+    def create_from_json(cls, partition_json: dict,
+                         provisioned_throughput: Optional[int] = None) -> "DiskThroughputMetrics":
         if not partition_json.get("DISK_PARTITION_THROUGHPUT_READ"):
             raise ValueError(
                 "DISK_PARTITION_THROUGHPUT_READ is missing from partition_json "
@@ -106,9 +116,21 @@ class DiskThroughputMetrics:
             raw = Series.from_raw(name=name, raw=partition_json.get(name))
             return raw if raw else Series.empty(name=name, unit="BYTES_PER_SECOND")
 
+        read = pull("DISK_PARTITION_THROUGHPUT_READ")
+        write = pull("DISK_PARTITION_THROUGHPUT_WRITE")
+        # Reuses the same helper as DiskIopsMetrics so the (read + write)
+        # / provisioned math has one source of truth across the two
+        # per-partition rate metrics.
+        from common.disk_iops_metrics import _combined_percentage
+        used_percentage = _combined_percentage(
+            read=read, write=write, provisioned=provisioned_throughput,
+            name="DISK_THROUGHPUT_USED_PERCENTAGE",
+        )
         return cls(
-            read=pull("DISK_PARTITION_THROUGHPUT_READ"),
-            write=pull("DISK_PARTITION_THROUGHPUT_WRITE"),
+            read=read,
+            write=write,
+            provisioned_throughput=provisioned_throughput,
+            used_percentage=used_percentage,
         )
 
     # ---- introspection ---------------------------------------------------
@@ -129,6 +151,8 @@ class DiskThroughputMetrics:
         return DiskThroughputMetrics(
             read=self.read.trimmed(start_ts, end_ts),
             write=self.write.trimmed(start_ts, end_ts),
+            provisioned_throughput=self.provisioned_throughput,
+            used_percentage=self.used_percentage.trimmed(start_ts, end_ts),
         )
 
     # ---- provisioned-throughput ceiling ---------------------------------

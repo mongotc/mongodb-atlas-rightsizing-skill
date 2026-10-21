@@ -23,8 +23,8 @@ import os
 import sys
 
 # Bare-import style, matching the extraction package.
-import evaluate as evaluate_mod
-from report import build_report_json, build_report_md, write_report
+import rightsizing.old.evaluate as evaluate_mod
+from rightsizing.old.report import build_report_json, build_report_md, write_report
 from thresholds import DEFAULT_YAML_PATH, load_thresholds
 
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import operator
 from dataclasses import dataclass
 from typing import Optional
 from common.series import Series
@@ -17,14 +18,25 @@ class DiskIopsMetrics:
     """Read / write IOPS for one disk partition. Both values are per-second
     rates (unit: SCALAR_PER_SECOND). The constructor takes the dict at
     `data.disks[partition_name]` because disks are a sibling scope to
-    `data.host`, not nested under it."""
-    read: Series   # DISK_PARTITION_IOPS_READ
-    write: Series  # DISK_PARTITION_IOPS_WRITE
+    `data.host`, not nested under it.
+
+    `provisioned_iops` is the cluster-level cap (same across every
+    partition on the tier). When supplied, `used_percentage` is populated
+    as 100 × (read + write) / provisioned — the same pre-computed
+    percentage pattern that SystemMemoryMetrics uses for memory. When
+    `provisioned_iops` is None (unresolvable provider / tier), the field
+    is an empty Series and the rightsizing evaluator produces a no-data
+    verdict upstream."""
+    read: Series                       # DISK_PARTITION_IOPS_READ
+    write: Series                      # DISK_PARTITION_IOPS_WRITE
+    provisioned_iops: Optional[int]    # tier-level ceiling, or None
+    used_percentage: Series            # 100 × (read + write) / provisioned
 
     # ---- parsers ---------------------------------------------------------
 
     @classmethod
-    def create_from_json(cls, partition_json: dict) -> "DiskIopsMetrics":
+    def create_from_json(cls, partition_json: dict,
+                         provisioned_iops: Optional[int] = None) -> "DiskIopsMetrics":
         if not partition_json.get("DISK_PARTITION_IOPS_READ"):
             raise ValueError(
                 "DISK_PARTITION_IOPS_READ is missing from partition_json — "
@@ -37,9 +49,17 @@ class DiskIopsMetrics:
             raw = Series.from_raw(name=name, raw=partition_json.get(name))
             return raw if raw else Series.empty(name=name, unit="SCALAR_PER_SECOND")
 
+        read = pull("DISK_PARTITION_IOPS_READ")
+        write = pull("DISK_PARTITION_IOPS_WRITE")
+        used_percentage = _combined_percentage(
+            read=read, write=write, provisioned=provisioned_iops,
+            name="DISK_IOPS_USED_PERCENTAGE",
+        )
         return cls(
-            read=pull("DISK_PARTITION_IOPS_READ"),
-            write=pull("DISK_PARTITION_IOPS_WRITE"),
+            read=read,
+            write=write,
+            provisioned_iops=provisioned_iops,
+            used_percentage=used_percentage,
         )
 
     # ---- introspection ---------------------------------------------------
@@ -63,6 +83,8 @@ class DiskIopsMetrics:
         return DiskIopsMetrics(
             read=self.read.trimmed(start_ts, end_ts),
             write=self.write.trimmed(start_ts, end_ts),
+            provisioned_iops=self.provisioned_iops,
+            used_percentage=self.used_percentage.trimmed(start_ts, end_ts),
         )
 
     # ---- provisioned IOPS ceiling ---------------------------------------
@@ -158,3 +180,19 @@ class DiskIopsMetrics:
             return None
 
         return None
+
+
+def _combined_percentage(read: Series, write: Series,
+                         provisioned: Optional[float], name: str) -> Series:
+    """Build the "used %" series shared by DiskIopsMetrics and
+    DiskThroughputMetrics: 100 × (read + write) / provisioned, per sample.
+    Returns an empty PERCENT Series when provisioned is None or
+    non-positive — the evaluator treats that as a no-data verdict."""
+    if not provisioned or provisioned <= 0:
+        return Series.empty(name=name, unit="PERCENT")
+    combined = read.combined(other=write, fn=operator.add)
+    return combined.mapped(
+        fn=lambda v: 100.0 * v / provisioned,
+        name=name,
+        unit="PERCENT",
+    )
